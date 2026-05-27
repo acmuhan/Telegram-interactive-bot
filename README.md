@@ -90,6 +90,7 @@ ghcr.io/acmuhan/telegram-interactive-bot:latest
 
 ```bash
 cp .env_example .env
+cp docker-compose.template.yml docker-compose.yml
 # 编辑 .env
 mkdir -p data
 docker compose up -d

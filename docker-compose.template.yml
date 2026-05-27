@@ -1,0 +1,28 @@
+# Docker Compose deployment template for Telegram-interactive-bot.
+#
+# Usage:
+#   cp docker-compose.template.yml docker-compose.yml
+#   cp .env_example .env
+#   mkdir -p data
+#   docker compose up -d
+#
+# Notes:
+#   - Keep secrets in .env, never commit your real .env file.
+#   - ./data persists SQLite DB and python-telegram-bot pickle state.
+#   - Set pull_policy: always if you want compose to refresh the GHCR image on each start.
+
+services:
+  telegram-interactive-bot:
+    image: ghcr.io/acmuhan/telegram-interactive-bot:latest
+    container_name: telegram-interactive-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    # pull_policy: always
+    # logging:
+    #   driver: json-file
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"
