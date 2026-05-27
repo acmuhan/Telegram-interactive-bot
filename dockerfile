@@ -14,8 +14,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . ./
 RUN mkdir -p /app/data && chown -R app:app /app
 
-USER app
-
 VOLUME ["/app/data"]
 
 CMD ["python", "-m", "interactive_bot"]
