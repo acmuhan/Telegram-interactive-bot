@@ -1,8 +1,11 @@
+import asyncio
 import os
 import random
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from html import escape
 from string import ascii_letters as letters
+from typing import ParamSpec, TypeVar
 
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -19,7 +22,7 @@ from telegram.ext import (
 from telegram.helpers import mention_html
 
 from db.database import Base, engine, session_scope
-from db.model import ForumStatus, MediaGroupMessage, MessageMap, User
+from db.model import ForumStatus, MediaGroupMessage, MessageMap, User, run_schema_migrations
 
 from . import (
     PERSISTENCE_PATH,
@@ -27,7 +30,9 @@ from . import (
     admin_user_ids,
     app_name,
     bot_token,
+    captcha_cooldown_seconds,
     disable_captcha,
+    enable_pickle_persistence,
     is_delete_topic_as_ban_forever,
     is_delete_user_messages,
     logger,
@@ -38,11 +43,32 @@ from . import (
 from .utils import delete_message_later
 
 Base.metadata.create_all(bind=engine)
+run_schema_migrations(engine)
+
+P = ParamSpec("P")
+T = TypeVar("T")
+CAPTCHA_COOLDOWN_SECONDS = captcha_cooldown_seconds
+_topic_locks: dict[int, asyncio.Lock] = {}
+_topic_locks_guard = asyncio.Lock()
 
 
 def _chunked(values: list[int], size: int = 100) -> Iterable[list[int]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
+
+
+async def db_call(func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Run synchronous SQLAlchemy helpers outside the asyncio event loop."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def _get_topic_lock(user_id: int) -> asyncio.Lock:
+    async with _topic_locks_guard:
+        lock = _topic_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _topic_locks[user_id] = lock
+        return lock
 
 
 def update_user_db(user: telegram.User) -> None:
@@ -110,6 +136,14 @@ def set_thread_status(message_thread_id: int, status: str) -> None:
                     status=status,
                 )
             )
+
+
+def reset_user_topic(user_id: int) -> None:
+    with session_scope() as db:
+        item = db.query(User).filter(User.user_id == user_id).first()
+        if item:
+            item.message_thread_id = 0
+            db.add(item)
 
 
 def save_message_map(user_id: int, user_message_id: int, group_message_id: int) -> None:
@@ -180,6 +214,16 @@ def get_media_group_messages(chat_id: int, media_group_id: str) -> list[MediaGro
         )
 
 
+def get_user_message_ids(user_id: int) -> list[int]:
+    with session_scope() as db:
+        return [item.user_chat_message_id for item in db.query(MessageMap).filter(MessageMap.user_id == user_id).all()]
+
+
+def get_all_users() -> list[User]:
+    with session_scope() as db:
+        return db.query(User).all()
+
+
 async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> None:
     buttons = [
         [
@@ -193,7 +237,7 @@ async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram
         buttons.append([InlineKeyboardButton("👤 直接联络", url=f"https://t.me/{user.username}")])
 
     user_photo = await context.bot.get_user_profile_photos(user.id)
-    caption = f"👤 {mention_html(user.id, user.first_name)}\n\n📱 {user.id}\n\n🔗 @{user.username if user.username else '无'}"
+    caption = f"👤 {mention_html(user.id, user.first_name)}\n\n📱 {user.id}\n\n🔗 @{escape(user.username) if user.username else '无'}"
     if user_photo.total_count:
         photo = user_photo.photos[0][-1].file_id
         await context.bot.send_photo(
@@ -219,14 +263,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not update.message or not user:
         return
-    update_user_db(user)
+    await db_call(update_user_db, user)
 
     if user.id in admin_user_ids:
         try:
             admin_group = await context.bot.get_chat(admin_group_id)
             if admin_group.type not in {"supergroup", "group"}:
                 raise RuntimeError("ADMIN_GROUP_ID 不是群组")
-        except BadRequest as exc:
+        except BadRequest:
             logger.error(
                 "Admin group check failed: chat not found. ADMIN_GROUP_ID=%s. "
                 "Make sure the bot has been added to the admin group and the group id is correct.",
@@ -245,15 +289,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:
             logger.exception("Admin group check failed")
             await update.message.reply_html(
-                f"⚠️ 后台管理群组设置错误，请检查机器人是否已入群并拥有消息/话题管理权限。\n错误细节：{exc}"
+                "⚠️ 后台管理群组设置错误，请检查机器人是否已入群并拥有消息/话题管理权限。\n"
+                f"错误细节：{escape(str(exc))}"
             )
             return
         await update.message.reply_html(
-            f"你好管理员 {user.first_name}({user.id})\n\n欢迎使用 {app_name} 机器人。\n当前后台群组：<b>{admin_group.title}</b>"
+            f"你好管理员 {mention_html(user.id, user.first_name)}({user.id})\n\n"
+            f"欢迎使用 {escape(app_name)} 机器人。\n当前后台群组：<b>{escape(admin_group.title or '')}</b>"
         )
         return
 
-    await update.message.reply_html(f"{mention_html(user.id, user.full_name)} 同学：\n\n{welcome_message}")
+    await update.message.reply_html(f"{mention_html(user.id, user.full_name)} 同学：\n\n{escape(welcome_message)}")
 
 
 async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -265,6 +311,9 @@ async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         return True
     if context.user_data.get("is_human_error_time", 0) > time.time() - 120:
         await message.reply_html("你已经被禁言，请稍后再尝试。")
+        return False
+    if CAPTCHA_COOLDOWN_SECONDS and context.user_data and context.user_data.get("last_captcha_time", 0) > time.time() - CAPTCHA_COOLDOWN_SECONDS:
+        await message.reply_html("请先完成上一条验证码，稍后再尝试。")
         return False
 
     image_dir = "./assets/imgs"
@@ -286,6 +335,7 @@ async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         biggest_photo = max(sent.photo, key=lambda x: x.file_size or 0)
         context.bot_data[f"image|{code}"] = biggest_photo.file_id
     context.user_data["vcode"] = code
+    context.user_data["last_captcha_time"] = time.time()
     await delete_message_later(60, sent.chat.id, sent.message_id, context)
     return False
 
@@ -311,6 +361,7 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML",
         )
         context.user_data["is_human"] = True
+        context.user_data.pop("last_captcha_time", None)
     else:
         await query.answer("错误，禁言 2 分钟")
         context.user_data["is_human_error_time"] = time.time()
@@ -321,21 +372,19 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def ensure_user_topic(user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> int:
-    db_user = get_user_by_id(user.id)
-    if db_user and db_user.message_thread_id:
-        return db_user.message_thread_id
+    lock = await _get_topic_lock(user.id)
+    async with lock:
+        db_user = await db_call(get_user_by_id, user.id)
+        if db_user and db_user.message_thread_id:
+            return db_user.message_thread_id
 
-    forum_topic = await context.bot.create_forum_topic(
-        admin_group_id,
-        name=f"{user.full_name}|{user.id}"[:128],
-    )
-    message_thread_id = forum_topic.message_thread_id
-    with session_scope() as db:
-        item = db.query(User).filter(User.user_id == user.id).first()
-        if item:
-            item.message_thread_id = message_thread_id
-            db.add(item)
-    set_thread_status(message_thread_id, "opened")
+        forum_topic = await context.bot.create_forum_topic(
+            admin_group_id,
+            name=f"{user.full_name}|{user.id}"[:128],
+        )
+        message_thread_id = forum_topic.message_thread_id
+        await db_call(_set_user_topic, user.id, message_thread_id)
+        await db_call(set_thread_status, message_thread_id, "opened")
     await context.bot.send_message(
         admin_group_id,
         f"新的用户 {mention_html(user.id, user.full_name)} 开始了一个新的会话。",
@@ -344,6 +393,14 @@ async def ensure_user_topic(user: telegram.User, context: ContextTypes.DEFAULT_T
     )
     await send_contact_card(admin_group_id, message_thread_id, user, context)
     return message_thread_id
+
+
+def _set_user_topic(user_id: int, message_thread_id: int) -> None:
+    with session_scope() as db:
+        item = db.query(User).filter(User.user_id == user_id).first()
+        if item:
+            item.message_thread_id = message_thread_id
+            db.add(item)
 
 
 async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -356,13 +413,13 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE) -> None:
     direction = data["direction"]
     media_group_id = str(data["media_group_id"])
 
-    media_messages = get_media_group_messages(from_chat_id, media_group_id)
+    media_messages = await db_call(get_media_group_messages, from_chat_id, media_group_id)
     if not media_messages:
         return
 
     try:
         if direction == "u2a":
-            db_user = get_user_by_id(from_chat_id)
+            db_user = await db_call(get_user_by_id, from_chat_id)
             if not db_user or not db_user.message_thread_id:
                 return
             copied = await context.bot.copy_messages(
@@ -372,7 +429,7 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE) -> None:
                 message_thread_id=db_user.message_thread_id,
             )
             for sent, original in zip(copied, media_messages):
-                save_message_map(from_chat_id, original.message_id, sent.message_id)
+                await db_call(save_message_map, from_chat_id, original.message_id, sent.message_id)
         else:
             copied = await context.bot.copy_messages(
                 chat_id=target_id,
@@ -380,7 +437,7 @@ async def _send_media_group_later(context: ContextTypes.DEFAULT_TYPE) -> None:
                 message_ids=[m.message_id for m in media_messages],
             )
             for sent, original in zip(copied, media_messages):
-                save_message_map(target_id, sent.message_id, original.message_id)
+                await db_call(save_message_map, target_id, sent.message_id, original.message_id)
     except TelegramError:
         logger.exception("Failed to send media group %s", media_group_id)
 
@@ -414,27 +471,27 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if not message or not user:
         return
-    if not disable_captcha and not await check_human(update, context):
-        return
     if message_interval and context.user_data.get("last_message_time", 0) > time.time() - message_interval:
         await message.reply_html("请不要频繁发送消息。")
         return
+    if not disable_captcha and not await check_human(update, context):
+        return
     context.user_data["last_message_time"] = time.time()
 
-    update_user_db(user)
+    await db_call(update_user_db, user)
     message_thread_id = await ensure_user_topic(user, context)
-    if get_thread_status(message_thread_id) == "closed":
+    if await db_call(get_thread_status, message_thread_id) == "closed":
         await message.reply_html("客服已经关闭对话。如需联系，请通过其他途径联系对方重新打开对话。")
         return
 
     if message.media_group_id:
-        save_media_group_message(message.chat.id, message.message_id, str(message.media_group_id), message.caption_html)
+        await db_call(save_media_group_message, message.chat.id, message.message_id, str(message.media_group_id), message.caption_html)
         await schedule_media_group(media_group_delay, user.id, admin_group_id, str(message.media_group_id), "u2a", context)
         return
 
     params = {"message_thread_id": message_thread_id}
     if message.reply_to_message:
-        reply_id = find_group_reply_id(message.reply_to_message.message_id)
+        reply_id = await db_call(find_group_reply_id, message.reply_to_message.message_id)
         if reply_id:
             params["reply_to_message_id"] = reply_id
     try:
@@ -444,21 +501,17 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
             message_id=message.message_id,
             **params,
         )
-        save_message_map(user.id, message.message_id, copied.message_id)
+        await db_call(save_message_map, user.id, message.message_id, copied.message_id)
     except BadRequest as exc:
         logger.warning("User to admin forwarding failed: %s", exc)
         if is_delete_topic_as_ban_forever:
             await message.reply_html("发送失败，你的对话已经被客服删除。请联系客服重新打开对话。")
         else:
-            with session_scope() as db:
-                item = db.query(User).filter(User.user_id == user.id).first()
-                if item:
-                    item.message_thread_id = 0
-                    db.add(item)
+            await db_call(reset_user_topic, user.id)
             await message.reply_html("发送失败，你的对话已经被客服删除。请再发送一条消息来重新激活对话。")
     except TelegramError as exc:
         logger.exception("User to admin forwarding failed")
-        await message.reply_html(f"发送失败：{exc}")
+        await message.reply_html(f"发送失败：{escape(str(exc))}")
 
 
 async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,40 +519,40 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
     admin = update.effective_user
     if not message or not admin:
         return
-    update_user_db(admin)
+    await db_call(update_user_db, admin)
 
     message_thread_id = message.message_thread_id
     if not message_thread_id:
         return
-    target_user = get_user_by_thread(message_thread_id)
+    target_user = await db_call(get_user_by_thread, message_thread_id)
     if not target_user:
         logger.debug("No user mapped for thread %s", message_thread_id)
         return
     user_id = target_user.user_id
 
     if message.forum_topic_created:
-        set_thread_status(message_thread_id, "opened")
+        await db_call(set_thread_status, message_thread_id, "opened")
         return
     if message.forum_topic_closed:
-        set_thread_status(message_thread_id, "closed")
+        await db_call(set_thread_status, message_thread_id, "closed")
         await context.bot.send_message(user_id, "对话已经结束。对方已经关闭了对话。你的留言将被忽略。")
         return
     if message.forum_topic_reopened:
-        set_thread_status(message_thread_id, "opened")
+        await db_call(set_thread_status, message_thread_id, "opened")
         await context.bot.send_message(user_id, "对方重新打开了对话。可以继续对话了。")
         return
-    if get_thread_status(message_thread_id) == "closed":
+    if await db_call(get_thread_status, message_thread_id) == "closed":
         await message.reply_html("对话已经结束。希望和对方联系，需要打开对话。")
         return
 
     if message.media_group_id:
-        save_media_group_message(message.chat.id, message.message_id, str(message.media_group_id), message.caption_html)
+        await db_call(save_media_group_message, message.chat.id, message.message_id, str(message.media_group_id), message.caption_html)
         await schedule_media_group(media_group_delay, message.chat.id, user_id, str(message.media_group_id), "a2u", context)
         return
 
     params = {}
     if message.reply_to_message:
-        reply_id = find_user_reply_id(message.reply_to_message.message_id)
+        reply_id = await db_call(find_user_reply_id, message.reply_to_message.message_id)
         if reply_id:
             params["reply_to_message_id"] = reply_id
     try:
@@ -509,10 +562,10 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
             message_id=message.message_id,
             **params,
         )
-        save_message_map(user_id, copied.message_id, message.message_id)
+        await db_call(save_message_map, user_id, copied.message_id, message.message_id)
     except TelegramError as exc:
         logger.exception("Admin to user forwarding failed")
-        await message.reply_html(f"发送失败：{exc}")
+        await message.reply_html(f"发送失败：{escape(str(exc))}")
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -527,17 +580,18 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html("请在用户会话话题内使用 /clear。")
         return
 
-    target_user = get_user_by_thread(message.message_thread_id)
+    target_user = await db_call(get_user_by_thread, message.message_thread_id)
     await context.bot.delete_forum_topic(message.chat.id, message.message_thread_id)
-    set_thread_status(message.message_thread_id, "closed")
+    if is_delete_topic_as_ban_forever:
+        await db_call(set_thread_status, message.message_thread_id, "closed")
+    elif target_user:
+        await db_call(reset_user_topic, target_user.user_id)
+        await db_call(set_thread_status, message.message_thread_id, "deleted")
+
     if not is_delete_user_messages or not target_user:
         return
 
-    with session_scope() as db:
-        message_ids = [
-            item.user_chat_message_id
-            for item in db.query(MessageMap).filter(MessageMap.user_id == target_user.user_id).all()
-        ]
+    message_ids = await db_call(get_user_message_ids, target_user.user_id)
     for chunk in _chunked(message_ids):
         try:
             await context.bot.delete_messages(target_user.user_id, chunk)
@@ -550,8 +604,7 @@ async def _broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg_id = context.job.data["message_id"]
     chat_id = context.job.data["chat_id"]
-    with session_scope() as db:
-        users = db.query(User).all()
+    users = await db_call(get_all_users)
     success = 0
     failed = 0
     for item in users:
@@ -588,9 +641,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application():
-    os.makedirs(os.path.dirname(PERSISTENCE_PATH), exist_ok=True)
-    persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
-    application = ApplicationBuilder().token(bot_token).persistence(persistence=persistence).build()
+    builder = ApplicationBuilder().token(bot_token)
+    if enable_pickle_persistence:
+        os.makedirs(os.path.dirname(PERSISTENCE_PATH), exist_ok=True)
+        persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
+        builder = builder.persistence(persistence=persistence)
+    application = builder.build()
     application.add_handler(CommandHandler("start", start, filters.ChatType.PRIVATE))
     application.add_handler(MessageHandler(~filters.COMMAND & filters.ChatType.PRIVATE, forwarding_message_u2a))
     application.add_handler(MessageHandler(~filters.COMMAND & filters.Chat([admin_group_id]), forwarding_message_a2u))

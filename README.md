@@ -53,7 +53,9 @@ DELETE_TOPIC_AS_FOREVER_BAN=FALSE
 DELETE_USER_MESSAGE_ON_CLEAR_CMD=FALSE
 DISABLE_CAPTCHA=FALSE
 MESSAGE_INTERVAL=5
+CAPTCHA_COOLDOWN_SECONDS=30
 MEDIA_GROUP_DELAY=3
+ENABLE_PICKLE_PERSISTENCE=FALSE
 DATABASE_URL=sqlite:////app/data/db.sqlite3
 PERSISTENCE_PATH=/app/data/interactive-bot.pickle
 LOG_LEVEL=INFO
@@ -62,6 +64,7 @@ LOG_LEVEL=INFO
 重要说明：
 
 - `DELETE_USER_MESSAGE_ON_CLEAR_CMD` 默认建议保持 `FALSE`，避免误删用户侧聊天记录。
+- `ENABLE_PICKLE_PERSISTENCE` 默认关闭；pickle 文件只能来自可信 `data/` 目录，不能挂载或复制不可信文件。
 - Docker 部署时，数据库与持久化文件建议保存在 `/app/data`，并通过 volume 挂载出来。
 - 本项目默认使用 SQLite；高并发或长期大规模运营时建议改用 PostgreSQL。
 

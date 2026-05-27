@@ -76,12 +76,14 @@ if not admin_group_id:
     raise RuntimeError("ADMIN_GROUP_ID 未填写")
 admin_user_ids = _int_list_env("ADMIN_USER_IDS")
 
-# Safer defaults for destructive operations.
+# Safer defaults for destructive operations and untrusted persisted state.
 is_delete_topic_as_ban_forever = _bool_env("DELETE_TOPIC_AS_FOREVER_BAN", False)
 is_delete_user_messages = _bool_env("DELETE_USER_MESSAGE_ON_CLEAR_CMD", False)
 disable_captcha = _bool_env("DISABLE_CAPTCHA", False)
+enable_pickle_persistence = _bool_env("ENABLE_PICKLE_PERSISTENCE", False)
 message_interval = _int_env("MESSAGE_INTERVAL", 5)
 media_group_delay = _int_env("MEDIA_GROUP_DELAY", 3)
+captcha_cooldown_seconds = _int_env("CAPTCHA_COOLDOWN_SECONDS", 30)
 
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'data' / 'db.sqlite3'}")
 PERSISTENCE_PATH = os.getenv("PERSISTENCE_PATH", str(BASE_DIR / "data" / f"{app_name}.pickle"))

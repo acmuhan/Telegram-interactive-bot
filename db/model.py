@@ -1,4 +1,5 @@
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, UniqueConstraint, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -61,3 +62,38 @@ class User(Base):
     is_premium = Column(Boolean, default=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     message_thread_id = Column(Integer, default=0, nullable=False)
+
+
+def _sqlite_columns(engine: Engine, table_name: str) -> set[str]:
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"PRAGMA table_info({table_name})")).mappings().all()
+    return {str(row["name"]) for row in rows}
+
+
+def run_schema_migrations(engine: Engine) -> None:
+    """Apply small backwards-compatible SQLite migrations after create_all().
+
+    This is intentionally conservative: it only adds missing nullable/defaulted
+    columns that the app needs. Larger changes should move to Alembic.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    with engine.begin() as conn:
+        user_columns = _sqlite_columns(engine, "user")
+        if "message_thread_id" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN message_thread_id INTEGER NOT NULL DEFAULT 0'))
+        if "is_premium" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN is_premium BOOLEAN DEFAULT 0'))
+        if "updated_at" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN updated_at DATETIME'))
+
+        media_columns = _sqlite_columns(engine, "media_group_message")
+        if "caption_html" not in media_columns:
+            conn.execute(text("ALTER TABLE media_group_message ADD COLUMN caption_html VARCHAR(65536)"))
+        if "created_at" not in media_columns:
+            conn.execute(text("ALTER TABLE media_group_message ADD COLUMN created_at DATETIME"))
+
+        message_map_columns = _sqlite_columns(engine, "message_map")
+        if "created_at" not in message_map_columns:
+            conn.execute(text("ALTER TABLE message_map ADD COLUMN created_at DATETIME"))
