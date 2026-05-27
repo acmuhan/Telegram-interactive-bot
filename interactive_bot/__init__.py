@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -49,7 +50,25 @@ def _int_list_env(name: str) -> list[int]:
         raise RuntimeError(f"{name} 应该是以英文逗号分隔的数字") from exc
 
 
-bot_token = _required("BOT_TOKEN")
+def _token_prefix(token: str) -> str:
+    return token.split(":", 1)[0] if ":" in token else "unknown"
+
+
+def _validate_bot_token(token: str) -> str:
+    token = token.strip()
+    # BotFather tokens are exactly '<numeric bot id>:<secret>'. A duplicated prefix like
+    # '123:123:ABC' is a common copy/paste mistake and Telegram will echo the invalid
+    # token in PTB's InvalidToken exception, so fail locally before network bootstrap.
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
+        raise RuntimeError(
+            "BOT_TOKEN 格式不正确。请从 BotFather 复制完整 token，格式应为 "
+            "'<数字ID>:<密钥>'，中间只能有一个冒号。当前 token 前缀: "
+            f"{_token_prefix(token)}"
+        )
+    return token
+
+
+bot_token = _validate_bot_token(_required("BOT_TOKEN"))
 app_name = os.getenv("APP_NAME", "interactive-bot")
 welcome_message = os.getenv("WELCOME_MESSAGE", "欢迎使用本机器人")
 admin_group_id = _int_env("ADMIN_GROUP_ID", 0)
