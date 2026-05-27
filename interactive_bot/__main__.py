@@ -226,6 +226,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             admin_group = await context.bot.get_chat(admin_group_id)
             if admin_group.type not in {"supergroup", "group"}:
                 raise RuntimeError("ADMIN_GROUP_ID 不是群组")
+        except BadRequest as exc:
+            logger.error(
+                "Admin group check failed: chat not found. ADMIN_GROUP_ID=%s. "
+                "Make sure the bot has been added to the admin group and the group id is correct.",
+                admin_group_id,
+            )
+            await update.message.reply_html(
+                "⚠️ 后台管理群组设置错误：Telegram 返回 <code>Chat not found</code>。\n\n"
+                f"当前 ADMIN_GROUP_ID：<code>{admin_group_id}</code>\n\n"
+                "请检查：\n"
+                "1. 机器人是否已经加入后台群；\n"
+                "2. 后台群 ID 是否完整，超级群通常以 <code>-100</code> 开头；\n"
+                "3. 如果刚把普通群升级为话题群/超级群，请重新获取群 ID；\n"
+                "4. 机器人是否拥有消息管理和话题管理权限。"
+            )
+            return
         except Exception as exc:
             logger.exception("Admin group check failed")
             await update.message.reply_html(
