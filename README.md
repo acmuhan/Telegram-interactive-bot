@@ -1,97 +1,143 @@
-# Telegram interactive bot (Telegram 双向机器人)
+# Telegram interactive bot (Telegram 双向客服机器人)
 
-## 一、简介
-Telegram的开源双向机器人。避免垃圾信息；让被限制的客户可以顺利联系到你。
-支持后台多客服。在后台群组，可以安排多个客服以同一个机器人身份持续和客户沟通。
+Telegram 开源双向客服机器人。用户私聊机器人后，消息会被转发到后台管理群的独立话题；客服在对应话题中回复，机器人再将消息转回用户。
 
-[English](https://github.com/MiHaKun/Telegram-interactive-bot/blob/master/README.en.md) | [示例机器人](https://t.me/CustomerConnectBot) | [示例后台](https://t.me/MiHaCMSGroup)
+[English](./README.en.md) | [示例机器人](https://t.me/CustomerConnectBot) | [示例后台](https://t.me/MiHaCMSGroup)
 
-（ps：和示例机器人说话后，去后台看看，就大概知道原理了）
+## 功能特性
 
-（ps：示例后台是公开群组，方便大家看效果而已。自己部署，最好用私有群组，安全性还是没问题的）
+- 每个用户自动创建一个后台群话题，方便多客服协作。
+- 用户消息、客服回复双向转发。
+- 支持回复引用映射，尽量保持上下文。
+- 支持媒体组/相册延迟聚合转发。
+- 内置图片验证码，减少 userbot/垃圾消息。
+- 支持消息频率限制。
+- 支持关闭/重新打开话题控制会话状态。
+- 支持管理员 `/broadcast` 广播。
+- 支持 Docker / Docker Compose 部署。
+- GitHub Actions 自动构建并发布 GHCR Docker 镜像。
 
-![image](https://github.com/user-attachments/assets/69dd3cd2-69e5-4925-9b9d-63b8ee8d2139)
+## 准备工作
 
+1. 找 [@BotFather](https://t.me/BotFather) 创建机器人并获取 `BOT_TOKEN`。
+2. 创建一个 Telegram 群组。
+3. 打开群组的话题/Forum 功能。
+4. 将机器人加入群组并提升为管理员。
+5. 确保机器人至少拥有：
+   - 消息管理权限
+   - 话题管理权限
+6. 通过 [@GetTheirIDBot](https://t.me/GetTheirIDBot) 获取：
+   - 后台群组 ID：`ADMIN_GROUP_ID`
+   - 管理员用户 ID：`ADMIN_USER_IDS`
 
-### 特色
-- 当客户通过机器人联系客服时，所有消息将被完整转发到后台管理群组，生成一个独立的以客户信息命名子论坛，用来和其他客户区分开来。
-- 客服在子论坛中的回复，可以直接回复给客户。
-- 客服可以通过关闭/开启子论坛来配置是否继续和客户对话。
-- 提供永久封禁方案。env内有开关。
-- 提供 /clear 命令，可以清除子论坛内的所有消息，同时也删除用户消息（极其不推荐如此使用，不过奈何也确实有时候有必要）。env内有开关。
+## 配置
 
-### 优势
-- 借助子论坛，可以增加多个管理成员，分担客服压力。
-- 可以直观的保留和客户沟通的完整通讯记录。
-- 可以得知某句话是哪个客服回复的，维系连贯的客户服务。
+复制示例配置：
 
-
-## 二、准备工作
-本机器人的主要原理是将客户和机器人的对话，转发到一个群内（自用，最好是私有群），并归纳每个客户的消息到一个子版块。
-所以，在开工前，你需要：
-1. 找 @BotFather 申请一个机器人。
-
-2. 获取机器人的token
-
-3. 建立一个群组（按需设置是否公开）
-
-4. 群组的“话题功能”打开。
-
-5. 将自己的机器人，拉入群组。提升权限为管理员。
-
-6. 管理权限切记包含`消息管理`，`话题管理`。
-
-7. 通过机器人 @GetTheirIDBot 获取群组的内置ID和管理员用户ID。
-
-   ![image-20240703082929589](./doc/cn/image-20240703082929589.png)![image-20240703083040852](./doc/cn/image-20240703083040852.png)
-
-## 三、部署运行
-
-### 1. 修改env
-打开`.env_example`，将自己机器人的Token、账号的API_ID/HASH、管理群组ID和管理员ID补全。
-另存`.env_example`为`.env`
-
-### 2. 获取代码/构建python venv
+```bash
+cp .env_example .env
 ```
-git clone https://github.com/MiHaKun/Telegram-interactive-bot.git
+
+按需修改 `.env`：
+
+```env
+APP_NAME=interactive-bot
+BOT_TOKEN=123456789:replace-with-your-bot-token
+ADMIN_GROUP_ID=-1000000000000
+ADMIN_USER_IDS=123456789,987654321
+WELCOME_MESSAGE="你好，请问有什么可以帮助你的吗？"
+
+DELETE_TOPIC_AS_FOREVER_BAN=FALSE
+DELETE_USER_MESSAGE_ON_CLEAR_CMD=FALSE
+DISABLE_CAPTCHA=FALSE
+MESSAGE_INTERVAL=5
+MEDIA_GROUP_DELAY=3
+DATABASE_URL=sqlite:///data/db.sqlite3
+PERSISTENCE_PATH=/app/data/interactive-bot.pickle
+LOG_LEVEL=INFO
+```
+
+重要说明：
+
+- `DELETE_USER_MESSAGE_ON_CLEAR_CMD` 默认建议保持 `FALSE`，避免误删用户侧聊天记录。
+- Docker 部署时，数据库与持久化文件建议保存在 `/app/data`，并通过 volume 挂载出来。
+- 本项目默认使用 SQLite；高并发或长期大规模运营时建议改用 PostgreSQL。
+
+## 本地运行
+
+```bash
+git clone https://github.com/acmuhan/Telegram-interactive-bot.git
 cd Telegram-interactive-bot
 python3 -m venv venv
 . venv/bin/activate
 pip install -r requirements.txt
-```
-### 3. 执行
-
-#### 3.1 普通执行
-```
-python -m interactive-bot
+cp .env_example .env
+# 编辑 .env
+python -m interactive_bot
 ```
 
-**PS:** 正式运营，还是需要类似`PM2`、`supervisor`之类的进程管理工具，配合看门狗来实现不间断运行、自动重启、失效重启等功能。 
+## Docker 运行
 
-#### 3.2 docker 执行
-1. 安装docker ， 参看 [Install Docker under Ubuntu 22.04](https://gist.github.com/dehsilvadeveloper/c3bdf0f4cdcc5c177e2fe9be671820c7)
-2. 执行`docker build -t tgibot .` 生成一个tgibot的镜像
-3. 执行`docker run --restart always --name telegram-interactive-bot  -v "$PWD":/app tgibot:latest` 生成容器并执行。
+### 使用 GitHub 托管镜像
 
-# ToDoList
-- [x] 准备完善下，docker化
-- [x] 支持消息回复功能。消息间可以相互引用。
-- [x] 完善下数据库。
-- [x] 添加客户的人机识别，防止无聊的人用userbot来刷
-- [x] 添加并识别媒体组消息。
-- [x] 精简点代码，利用**payload来展开forwarding的参数。
+GitHub Actions 会发布镜像到：
 
-# 关于
+```text
+ghcr.io/acmuhan/telegram-interactive-bot:latest
+```
 
-- 本产品基于Apache协议开源。
-- 作者 米哈( [@MrMiHa](https://t.me/MrMiHa) )是一个苦逼程序员，不是煤场奴工，有问题别太理直气壮的跑来下命令。
-- 讨论群组是 : https://t.me/DeveloperTeamGroup 欢迎加入后玩耍
-- 随意Fork，记得保留`关于`的内容。
-- 初版写了2小时。喜欢请打赏。不会部署，群里找我。
-- 服务器推荐RackNerd的。实际上，我也确实用这个。够便宜。这款就够：[2核3G--年32刀](https://my.racknerd.com/aff.php?aff=11705&pid=905) 
-- 实在搞不定部署，可以群里找大家帮忙部署下。服务器也可以找大家共用： https://t.me/DeveloperTeamGroup 
-- 实在实在实在搞不定部署，找  [@MrMiHa](https://t.me/MrMiHa)  同学付费部署……
+运行：
 
-# 详细部署文档
+```bash
+cp .env_example .env
+# 编辑 .env
+mkdir -p data
+docker compose up -d
+```
 
-[米哈同学的知识库](https://miha.uk/docs/tutor/telegram-interactive-bot/)
+### 本地构建镜像
+
+```bash
+docker build -t telegram-interactive-bot .
+docker run -d \
+  --name telegram-interactive-bot \
+  --restart unless-stopped \
+  --env-file .env \
+  -v "$PWD/data:/app/data" \
+  telegram-interactive-bot:latest
+```
+
+## GitHub Actions / GHCR
+
+仓库包含 `.github/workflows/docker-image.yml`：
+
+- PR：只构建，不推送镜像。
+- push 到 `master`：构建并推送 `latest`、分支、SHA 标签。
+- push tag `v*`：构建并推送版本标签。
+- 支持 `linux/amd64` 和 `linux/arm64`。
+
+如果 GHCR 包不可见，可在 GitHub 仓库页面进入 Packages，将容器包 visibility 调整为 Public。
+
+## 管理命令
+
+- `/start`：管理员私聊机器人时检查后台群配置。
+- `/clear`：在后台话题内删除该话题；如果 `DELETE_USER_MESSAGE_ON_CLEAR_CMD=TRUE`，还会尝试删除用户侧消息。
+- `/broadcast`：管理员在后台群回复某条消息并发送 `/broadcast`，机器人会把被回复的消息广播给已记录用户。
+
+## 近期现代化更新
+
+- 适配 `python-telegram-bot 22.x`。
+- 适配 `SQLAlchemy 2.x` 声明式基类。
+- 将 Python 包目录从 `interactive-bot` 迁移为 `interactive_bot`。
+- 移除全局共享数据库 Session，改为按操作创建/关闭 session。
+- 修复 SQLite 数据路径，默认写入 `data/`，便于 Docker volume 持久化。
+- 清理重复依赖。
+- 改善 Dockerfile：镜像内包含完整源码，不再依赖把整个源码目录挂载进容器。
+- 新增 `docker-compose.yml`。
+- 新增 GHCR Docker 镜像构建工作流。
+
+## 许可证与致谢
+
+本项目基于 Apache 协议开源。原作者：米哈 [@MrMiHa](https://t.me/MrMiHa)。
+
+如需 fork 或二次分发，请保留原作者信息。

@@ -1,10 +1,31 @@
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./assets/db.sqlite3"
+from interactive_bot import DATABASE_URL
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_size=100, max_overflow=200)
-SessionMaker = sessionmaker(bind=engine)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
+SessionMaker = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
+
+
+@contextmanager
+def session_scope():
+    session = SessionMaker()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
