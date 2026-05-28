@@ -235,6 +235,17 @@ def count_banned_users() -> int:
         return db.query(User).filter(User.is_banned.is_(True)).count()
 
 
+def get_banned_users(limit: int = 20) -> list[User]:
+    with session_scope() as db:
+        return (
+            db.query(User)
+            .filter(User.is_banned.is_(True))
+            .order_by(User.banned_at.desc().nullslast(), User.id.desc())
+            .limit(limit)
+            .all()
+        )
+
+
 def count_message_maps() -> int:
     with session_scope() as db:
         return db.query(MessageMap).count()
@@ -263,6 +274,20 @@ def set_user_ban(user_id: int, is_banned: bool, admin_id: int | None, reason: st
         db.flush()
         db.refresh(item)
         return item
+
+
+def format_user_label(user: User) -> str:
+    name = " ".join(part for part in [user.first_name, user.last_name] if part).strip() or "未知用户"
+    username = f"@{user.username}" if user.username else "无 username"
+    return f"{escape(name)} / {escape(username)} / <code>{user.user_id}</code>"
+
+
+def format_datetime(value: datetime | None) -> str:
+    if not value:
+        return "未知时间"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return escape(value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
 
 async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -704,6 +729,32 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html("你没有权限执行此操作。")
         return
 
+    if context.args and context.args[0].lower() == "list":
+        limit = 20
+        if len(context.args) > 1:
+            try:
+                limit = max(1, min(int(context.args[1]), 50))
+            except ValueError:
+                await message.reply_html("用法：<code>/ban list [数量]</code>，数量必须是 1-50。")
+                return
+        banned_users = await db_call(get_banned_users, limit)
+        total = await db_call(count_banned_users)
+        if not banned_users:
+            await message.reply_html("当前没有封禁用户。")
+            return
+        lines = [f"<b>封禁用户列表</b>（显示 {len(banned_users)}/{total}）"]
+        for index, item in enumerate(banned_users, start=1):
+            reason = escape(item.ban_reason or "无备注")
+            banned_by = f"<code>{item.banned_by}</code>" if item.banned_by else "未知管理员"
+            lines.append(
+                f"\n{index}. {format_user_label(item)}\n"
+                f"时间：{format_datetime(item.banned_at)}\n"
+                f"管理员：{banned_by}\n"
+                f"备注：{reason}"
+            )
+        await message.reply_html("\n".join(lines))
+        return
+
     target_user_id: int | None = None
     reason_parts: list[str] = []
     if context.args:
@@ -711,7 +762,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             target_user_id = int(context.args[0])
             reason_parts = context.args[1:]
         except ValueError:
-            await message.reply_html("用法：在用户话题内发送 <code>/ban [原因]</code>，或发送 <code>/ban 用户ID [原因]</code>。")
+            await message.reply_html("用法：在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。备注必填。")
             return
     elif message.message_thread_id:
         target_user = await db_call(get_user_by_thread, message.message_thread_id)
@@ -719,13 +770,16 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             target_user_id = target_user.user_id
 
     if not target_user_id:
-        await message.reply_html("请在用户会话话题内使用 /ban，或使用 <code>/ban 用户ID [原因]</code>。")
+        await message.reply_html("请在用户会话话题内使用 /ban，或使用 <code>/ban 用户ID 备注</code>。备注必填。")
         return
     if target_user_id in admin_user_ids:
         await message.reply_html("不能封禁管理员。")
         return
 
-    reason = " ".join(reason_parts).strip() or None
+    reason = " ".join(reason_parts).strip()
+    if not reason:
+        await message.reply_html("封禁备注必填。用法：在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。")
+        return
     target_user = await db_call(set_user_ban, target_user_id, True, admin.id, reason)
     if not target_user:
         await message.reply_html(f"未找到用户 <code>{target_user_id}</code>，需要用户先和机器人产生过记录。")
@@ -741,7 +795,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await message.reply_html(
         f"已封禁用户 <code>{target_user_id}</code>。"
-        + (f"\n原因：{escape(reason)}" if reason else "")
+        f"\n备注：{escape(reason)}"
     )
 
 
@@ -830,8 +884,29 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling update %s: %s", update, context.error, exc_info=context.error)
 
 
+async def post_init(application) -> None:
+    """Register Telegram command suggestions after the bot starts."""
+    commands = [
+        ("start", "开始使用 / 检查后台群配置"),
+        ("status", "查看机器人状态"),
+        ("ban", "封禁用户或查看封禁列表"),
+        ("unban", "解除用户封禁"),
+        ("clear", "删除当前用户会话话题"),
+        ("broadcast", "广播被回复的消息"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands, scope=telegram.BotCommandScopeDefault())
+        await application.bot.set_my_commands(commands, scope=telegram.BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(
+            [("start", "开始使用 / 管理员检查后台群配置")],
+            scope=telegram.BotCommandScopeAllPrivateChats(),
+        )
+    except TelegramError:
+        logger.warning("Failed to register Telegram bot commands", exc_info=True)
+
+
 def build_application():
-    builder = ApplicationBuilder().token(bot_token)
+    builder = ApplicationBuilder().token(bot_token).post_init(post_init)
     if enable_pickle_persistence:
         os.makedirs(os.path.dirname(PERSISTENCE_PATH), exist_ok=True)
         persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
