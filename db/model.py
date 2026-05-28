@@ -62,6 +62,10 @@ class User(Base):
     is_premium = Column(Boolean, default=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     message_thread_id = Column(Integer, default=0, nullable=False)
+    is_banned = Column(Boolean, default=False, nullable=False)
+    banned_at = Column(DateTime(timezone=True))
+    banned_by = Column(BigInteger)
+    ban_reason = Column(String(1024))
 
 
 def _sqlite_columns(engine: Engine, table_name: str) -> set[str]:
@@ -87,6 +91,14 @@ def run_schema_migrations(engine: Engine) -> None:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN is_premium BOOLEAN DEFAULT 0'))
         if "updated_at" not in user_columns:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN updated_at DATETIME'))
+        if "is_banned" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT 0'))
+        if "banned_at" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN banned_at DATETIME'))
+        if "banned_by" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN banned_by BIGINT'))
+        if "ban_reason" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN ban_reason VARCHAR(1024)'))
 
         media_columns = _sqlite_columns(engine, "media_group_message")
         if "caption_html" not in media_columns:

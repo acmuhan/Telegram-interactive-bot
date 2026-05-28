@@ -3,6 +3,7 @@ import os
 import random
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 from html import escape
 from string import ascii_letters as letters
 from typing import ParamSpec, TypeVar
@@ -222,6 +223,46 @@ def get_user_message_ids(user_id: int) -> list[int]:
 def get_all_users() -> list[User]:
     with session_scope() as db:
         return db.query(User).all()
+
+
+def count_all_users() -> int:
+    with session_scope() as db:
+        return db.query(User).count()
+
+
+def count_banned_users() -> int:
+    with session_scope() as db:
+        return db.query(User).filter(User.is_banned.is_(True)).count()
+
+
+def count_message_maps() -> int:
+    with session_scope() as db:
+        return db.query(MessageMap).count()
+
+
+def count_topics_by_status(status: str) -> int:
+    with session_scope() as db:
+        return db.query(ForumStatus).filter(ForumStatus.chat_id == admin_group_id, ForumStatus.status == status).count()
+
+
+def set_user_ban(user_id: int, is_banned: bool, admin_id: int | None, reason: str | None = None) -> User | None:
+    with session_scope() as db:
+        item = db.query(User).filter(User.user_id == user_id).first()
+        if not item:
+            return None
+        item.is_banned = is_banned
+        if is_banned:
+            item.banned_at = datetime.now(timezone.utc)
+            item.banned_by = admin_id
+            item.ban_reason = reason
+        else:
+            item.banned_at = None
+            item.banned_by = None
+            item.ban_reason = None
+        db.add(item)
+        db.flush()
+        db.refresh(item)
+        return item
 
 
 async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -479,6 +520,10 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["last_message_time"] = time.time()
 
     await db_call(update_user_db, user)
+    db_user = await db_call(get_user_by_id, user.id)
+    if db_user and db_user.is_banned:
+        await message.reply_html("你已被禁止使用本机器人。")
+        return
     message_thread_id = await ensure_user_topic(user, context)
     if await db_call(get_thread_status, message_thread_id) == "closed":
         await message.reply_html("客服已经关闭对话。如需联系，请通过其他途径联系对方重新打开对话。")
@@ -599,6 +644,107 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Failed to delete a chunk of user messages", exc_info=True)
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if user.id not in admin_user_ids:
+        await message.reply_html("你没有权限执行此操作。")
+        return
+
+    db_ok = True
+    db_error = ""
+    try:
+        total_users = await db_call(count_all_users)
+        banned_users = await db_call(count_banned_users)
+        open_topics = await db_call(count_topics_by_status, "opened")
+        closed_topics = await db_call(count_topics_by_status, "closed")
+        deleted_topics = await db_call(count_topics_by_status, "deleted")
+        message_maps = await db_call(count_message_maps)
+    except Exception as exc:
+        logger.exception("Status database check failed")
+        db_ok = False
+        db_error = str(exc)
+        total_users = banned_users = open_topics = closed_topics = deleted_topics = message_maps = 0
+
+    try:
+        admin_group = await context.bot.get_chat(admin_group_id)
+        group_title = admin_group.title or str(admin_group_id)
+        group_ok = True
+    except TelegramError as exc:
+        group_title = str(admin_group_id)
+        group_ok = False
+        db_error = db_error or str(exc)
+
+    await message.reply_html(
+        f"<b>{escape(app_name)} 状态</b>\n\n"
+        f"Bot：online\n"
+        f"后台群：{escape(group_title)} (<code>{admin_group_id}</code>)\n"
+        f"后台群检查：{'ok' if group_ok else 'failed'}\n"
+        f"数据库：{'ok' if db_ok else 'failed'}\n"
+        f"管理员数：{len(admin_user_ids)}\n"
+        f"已记录用户：{total_users}\n"
+        f"封禁用户：{banned_users}\n"
+        f"话题：opened={open_topics} closed={closed_topics} deleted={deleted_topics}\n"
+        f"消息映射：{message_maps}\n"
+        f"验证码：{'disabled' if disable_captcha else 'enabled'}\n"
+        f"消息间隔：{message_interval}s\n"
+        f"媒体组延迟：{media_group_delay}s"
+        + (f"\n\n错误：<code>{escape(db_error)}</code>" if db_error else "")
+    )
+
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("你没有权限执行此操作。")
+        return
+
+    target_user_id: int | None = None
+    reason_parts: list[str] = []
+    if context.args:
+        try:
+            target_user_id = int(context.args[0])
+            reason_parts = context.args[1:]
+        except ValueError:
+            await message.reply_html("用法：在用户话题内发送 <code>/ban [原因]</code>，或发送 <code>/ban 用户ID [原因]</code>。")
+            return
+    elif message.message_thread_id:
+        target_user = await db_call(get_user_by_thread, message.message_thread_id)
+        if target_user:
+            target_user_id = target_user.user_id
+
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /ban，或使用 <code>/ban 用户ID [原因]</code>。")
+        return
+    if target_user_id in admin_user_ids:
+        await message.reply_html("不能封禁管理员。")
+        return
+
+    reason = " ".join(reason_parts).strip() or None
+    target_user = await db_call(set_user_ban, target_user_id, True, admin.id, reason)
+    if not target_user:
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>，需要用户先和机器人产生过记录。")
+        return
+
+    if target_user.message_thread_id:
+        await db_call(set_thread_status, target_user.message_thread_id, "closed")
+
+    try:
+        await context.bot.send_message(target_user_id, "你已被禁止使用本机器人。")
+    except TelegramError:
+        logger.info("Failed to notify banned user %s", target_user_id, exc_info=True)
+
+    await message.reply_html(
+        f"已封禁用户 <code>{target_user_id}</code>。"
+        + (f"\n原因：{escape(reason)}" if reason else "")
+    )
+
+
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.job or not isinstance(context.job.data, dict):
         return
@@ -608,6 +754,9 @@ async def _broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
     success = 0
     failed = 0
     for item in users:
+        if item.is_banned:
+            failed += 1
+            continue
         try:
             chat = await context.bot.get_chat(item.user_id)
             await chat.send_copy(chat_id, msg_id)
@@ -651,6 +800,8 @@ def build_application():
     application.add_handler(MessageHandler(~filters.COMMAND & filters.ChatType.PRIVATE, forwarding_message_u2a))
     application.add_handler(MessageHandler(~filters.COMMAND & filters.Chat([admin_group_id]), forwarding_message_a2u))
     application.add_handler(CommandHandler("clear", clear, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("ban", ban, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("status", status, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("broadcast", broadcast, filters.Chat([admin_group_id])))
     application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^vcode_"))
     application.add_error_handler(error_handler)
