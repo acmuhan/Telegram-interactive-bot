@@ -745,6 +745,47 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("你没有权限执行此操作。")
+        return
+
+    target_user_id: int | None = None
+    if context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await message.reply_html("用法：在用户话题内发送 <code>/unban</code>，或发送 <code>/unban 用户ID</code>。")
+            return
+    elif message.message_thread_id:
+        target_user = await db_call(get_user_by_thread, message.message_thread_id)
+        if target_user:
+            target_user_id = target_user.user_id
+
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /unban，或使用 <code>/unban 用户ID</code>。")
+        return
+
+    target_user = await db_call(set_user_ban, target_user_id, False, admin.id)
+    if not target_user:
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>，需要用户先和机器人产生过记录。")
+        return
+
+    if target_user.message_thread_id:
+        await db_call(set_thread_status, target_user.message_thread_id, "opened")
+
+    try:
+        await context.bot.send_message(target_user_id, "你已被解除封禁，可以继续使用本机器人。")
+    except TelegramError:
+        logger.info("Failed to notify unbanned user %s", target_user_id, exc_info=True)
+
+    await message.reply_html(f"已解除封禁用户 <code>{target_user_id}</code>。")
+
+
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.job or not isinstance(context.job.data, dict):
         return
@@ -801,6 +842,7 @@ def build_application():
     application.add_handler(MessageHandler(~filters.COMMAND & filters.Chat([admin_group_id]), forwarding_message_a2u))
     application.add_handler(CommandHandler("clear", clear, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("ban", ban, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("unban", unban, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("status", status, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("broadcast", broadcast, filters.Chat([admin_group_id])))
     application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^vcode_"))
