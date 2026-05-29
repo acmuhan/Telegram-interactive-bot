@@ -5,7 +5,6 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from html import escape
-from string import ascii_letters as letters
 from typing import ParamSpec, TypeVar
 
 import telegram
@@ -41,7 +40,6 @@ from . import (
     message_interval,
     welcome_message,
 )
-from .utils import delete_message_later
 
 Base.metadata.create_all(bind=engine)
 run_schema_migrations(engine)
@@ -290,6 +288,99 @@ def format_datetime(value: datetime | None) -> str:
     return escape(value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
 
+def admin_panel_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("系统状态", callback_data="admin:status"),
+                InlineKeyboardButton("封禁列表", callback_data="admin:banlist"),
+            ],
+            [InlineKeyboardButton("管理指令说明", callback_data="admin:help")],
+        ]
+    )
+
+
+def user_start_markup(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("开始安全验证", callback_data=f"captcha:{user_id}:refresh:0")]]
+    )
+
+
+def admin_help_text() -> str:
+    return (
+        "<b>管理指令说明</b>\n\n"
+        "<code>/status</code>：查看系统状态。\n"
+        "<code>/ban 备注</code>：在用户会话话题内封禁当前用户，备注必填。\n"
+        "<code>/ban 用户ID 备注</code>：封禁指定用户。\n"
+        "<code>/ban list [数量]</code>：查看封禁用户列表。\n"
+        "<code>/unban</code>：在用户会话话题内解除当前用户封禁。\n"
+        "<code>/unban 用户ID</code>：解除指定用户封禁。\n"
+        "<code>/clear</code>：删除当前用户会话话题。\n"
+        "<code>/broadcast</code>：回复一条消息后广播给未封禁用户。"
+    )
+
+
+async def build_ban_list_text(limit: int = 20) -> str:
+    banned_users = await db_call(get_banned_users, limit)
+    total = await db_call(count_banned_users)
+    if not banned_users:
+        return "当前没有封禁用户。"
+    lines = [f"<b>封禁用户列表</b>（显示 {len(banned_users)}/{total}）"]
+    for index, item in enumerate(banned_users, start=1):
+        reason = escape(item.ban_reason or "无备注")
+        banned_by = f"<code>{item.banned_by}</code>" if item.banned_by else "未知管理员"
+        lines.append(
+            f"\n{index}. {format_user_label(item)}\n"
+            f"时间：{format_datetime(item.banned_at)}\n"
+            f"管理员：{banned_by}\n"
+            f"备注：{reason}"
+        )
+    return "\n".join(lines)
+
+
+async def build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    db_ok = True
+    db_error = ""
+    try:
+        total_users = await db_call(count_all_users)
+        banned_users = await db_call(count_banned_users)
+        open_topics = await db_call(count_topics_by_status, "opened")
+        closed_topics = await db_call(count_topics_by_status, "closed")
+        deleted_topics = await db_call(count_topics_by_status, "deleted")
+        message_maps = await db_call(count_message_maps)
+    except Exception as exc:
+        logger.exception("Status database check failed")
+        db_ok = False
+        db_error = str(exc)
+        total_users = banned_users = open_topics = closed_topics = deleted_topics = message_maps = 0
+
+    try:
+        admin_group = await context.bot.get_chat(admin_group_id)
+        group_title = admin_group.title or str(admin_group_id)
+        group_ok = True
+    except TelegramError as exc:
+        group_title = str(admin_group_id)
+        group_ok = False
+        db_error = db_error or str(exc)
+
+    return (
+        f"<b>{escape(app_name)} 状态</b>\n\n"
+        f"Bot：online\n"
+        f"后台群：{escape(group_title)} (<code>{admin_group_id}</code>)\n"
+        f"后台群检查：{'ok' if group_ok else 'failed'}\n"
+        f"数据库：{'ok' if db_ok else 'failed'}\n"
+        f"管理员数：{len(admin_user_ids)}\n"
+        f"已记录用户：{total_users}\n"
+        f"封禁用户：{banned_users}\n"
+        f"话题：opened={open_topics} closed={closed_topics} deleted={deleted_topics}\n"
+        f"消息映射：{message_maps}\n"
+        f"验证码：{'disabled' if disable_captcha else 'enabled'}\n"
+        f"消息间隔：{message_interval}s\n"
+        f"媒体组延迟：{media_group_delay}s"
+        + (f"\n\n错误：<code>{escape(db_error)}</code>" if db_error else "")
+    )
+
+
 async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> None:
     buttons = [
         [
@@ -360,12 +451,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         await update.message.reply_html(
-            f"你好管理员 {mention_html(user.id, user.first_name)}({user.id})\n\n"
-            f"欢迎使用 {escape(app_name)} 机器人。\n当前后台群组：<b>{escape(admin_group.title or '')}</b>"
+            f"管理员您好，{mention_html(user.id, user.first_name)}（<code>{user.id}</code>）。\n\n"
+            f"<b>{escape(app_name)}</b> 已连接后台群：<b>{escape(admin_group.title or '')}</b>。\n"
+            "您可以通过下方按钮查看状态或打开管理指令说明。",
+            reply_markup=admin_panel_markup(),
         )
         return
 
-    await update.message.reply_html(f"{mention_html(user.id, user.full_name)} 同学：\n\n{escape(welcome_message)}")
+    await update.message.reply_html(
+        f"{mention_html(user.id, user.full_name)}，您好。\n\n{escape(welcome_message)}\n\n"
+        "发送正式消息前，请先完成安全验证。",
+        reply_markup=user_start_markup(user.id),
+    )
+
+
+def _captcha_penalty_seconds(fail_count: int) -> int:
+    base = max(CAPTCHA_COOLDOWN_SECONDS, 30)
+    return min(base * (2 ** max(fail_count - 1, 0)), 15 * 60)
+
+
+def _new_numeric_captcha() -> dict:
+    digits = random.sample(range(10), 5)
+    solution = sorted(str(digit) for digit in digits)
+    now = time.time()
+    return {
+        "type": "numeric_sequence",
+        "digits": [str(digit) for digit in digits],
+        "solution": solution,
+        "progress": [],
+        "created_at": now,
+        "expires_at": now + 120,
+    }
+
+
+def _captcha_markup(user_id: int, state: dict) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(str(digit), callback_data=f"captcha:{user_id}:digit:{digit}") for digit in state["digits"]]
+    rows = [buttons[index : index + 5] for index in range(0, len(buttons), 5)]
+    rows.append([InlineKeyboardButton("刷新验证题", callback_data=f"captcha:{user_id}:refresh:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _captcha_text(state: dict) -> str:
+    progress = " ".join(state.get("progress") or []) or "尚未选择"
+    expires_at = format_datetime(datetime.fromtimestamp(float(state["expires_at"]), tz=timezone.utc))
+    return (
+        "<b>安全验证</b>\n\n"
+        "为保障服务质量，请先完成验证。验证通过后，系统将为您建立正式对话。\n\n"
+        "请按照从小到大的顺序依次点击下方数字。\n"
+        f"当前选择：<code>{escape(progress)}</code>\n"
+        f"有效期至：{expires_at}"
+    )
+
+
+async def send_captcha_challenge(
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_new: bool = False,
+    query: telegram.CallbackQuery | None = None,
+) -> None:
+    state = context.user_data.get("captcha_state")
+    now = time.time()
+    if force_new or not state or state.get("expires_at", 0) <= now:
+        state = _new_numeric_captcha()
+        context.user_data["captcha_state"] = state
+        context.user_data["last_captcha_time"] = now
+
+    text = _captcha_text(state)
+    markup = _captcha_markup(user_id, state)
+    if query:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 
 async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -375,34 +533,15 @@ async def check_human(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         return False
     if context.user_data.get("is_human", False):
         return True
-    if context.user_data.get("is_human_error_time", 0) > time.time() - 120:
-        await message.reply_html("你已经被禁言，请稍后再尝试。")
-        return False
-    if CAPTCHA_COOLDOWN_SECONDS and context.user_data and context.user_data.get("last_captcha_time", 0) > time.time() - CAPTCHA_COOLDOWN_SECONDS:
-        await message.reply_html("请先完成上一条验证码，稍后再尝试。")
+
+    now = time.time()
+    blocked_until = float(context.user_data.get("captcha_block_until", 0) or 0)
+    if blocked_until > now:
+        remain = int(blocked_until - now)
+        await message.reply_html(f"验证失败次数过多，请在 <code>{remain}</code> 秒后重试。")
         return False
 
-    image_dir = "./assets/imgs"
-    file_name = random.choice(os.listdir(image_dir))
-    code = file_name.replace("image_", "").replace(".png", "")
-    codes = ["".join(random.sample(letters, 5)) for _ in range(7)] + [code]
-    random.shuffle(codes)
-
-    photo = context.bot_data.get(f"image|{code}") or f"{image_dir}/{file_name}"
-    buttons = [InlineKeyboardButton(x, callback_data=f"vcode_{x}_{user.id}") for x in codes]
-    button_matrix = [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
-    sent = await message.reply_photo(
-        photo,
-        f"{mention_html(user.id, user.first_name)} 请选择图片中的文字。回答错误将无法联系客服。",
-        reply_markup=InlineKeyboardMarkup(button_matrix),
-        parse_mode="HTML",
-    )
-    if sent.photo:
-        biggest_photo = max(sent.photo, key=lambda x: x.file_size or 0)
-        context.bot_data[f"image|{code}"] = biggest_photo.file_id
-    context.user_data["vcode"] = code
-    context.user_data["last_captcha_time"] = time.time()
-    await delete_message_later(60, sent.chat.id, sent.message_id, context)
+    await send_captcha_challenge(message.chat.id, user.id, context, force_new=False)
     return False
 
 
@@ -411,30 +550,113 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
     if not query:
         return
     user = query.from_user
-    parts = query.data.split("_") if query.data else []
-    if len(parts) != 3:
-        await query.answer("验证码无效")
+    parts = query.data.split(":") if query.data else []
+    if len(parts) != 4 or parts[0] != "captcha":
+        await query.answer("验证请求无效。")
         return
-    _, code, user_id = parts
+    _, user_id, action, value = parts
     if user_id != str(user.id):
-        await query.answer("这不是你的验证码")
+        await query.answer("该验证不属于当前用户。", show_alert=True)
         return
-    if code == context.user_data.get("vcode"):
-        await query.answer("正确，欢迎。")
-        await context.bot.send_message(
-            update.effective_chat.id,
-            f"{mention_html(user.id, user.first_name)}，欢迎。",
-            parse_mode="HTML",
-        )
+
+    chat = update.effective_chat
+    if not chat:
+        await query.answer("验证请求无效。")
+        return
+
+    now = time.time()
+    blocked_until = float(context.user_data.get("captcha_block_until", 0) or 0)
+    if blocked_until > now:
+        remain = int(blocked_until - now)
+        await query.answer(f"验证已暂时锁定，请 {remain} 秒后重试。", show_alert=True)
+        return
+
+    if action == "refresh":
+        await query.answer("验证题已刷新。")
+        await send_captcha_challenge(chat.id, user.id, context, force_new=True, query=query)
+        return
+
+    state = context.user_data.get("captcha_state")
+    if not state or state.get("expires_at", 0) <= now:
+        await query.answer("验证题已过期，已为您刷新。")
+        await send_captcha_challenge(chat.id, user.id, context, force_new=True, query=query)
+        return
+    if action != "digit":
+        await query.answer("验证请求无效。")
+        return
+
+    progress = list(state.get("progress") or [])
+    solution = list(state.get("solution") or [])
+    expected = solution[len(progress)] if len(progress) < len(solution) else None
+    if value != expected:
+        fail_count = int(context.user_data.get("captcha_fail_count", 0) or 0) + 1
+        context.user_data["captcha_fail_count"] = fail_count
+        penalty = _captcha_penalty_seconds(fail_count)
+        context.user_data["captcha_block_until"] = now + penalty
+        context.user_data["captcha_state"] = _new_numeric_captcha()
+        await query.answer(f"验证失败，请 {penalty} 秒后重试。", show_alert=True)
+        if query.message:
+            await query.edit_message_text(
+                "<b>安全验证未通过</b>\n\n"
+                f"请在 <code>{penalty}</code> 秒后重新验证。连续失败会延长等待时间。",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("重新验证", callback_data=f"captcha:{user.id}:refresh:0")]]
+                ),
+            )
+        return
+
+    progress.append(value)
+    state["progress"] = progress
+    context.user_data["captcha_state"] = state
+    if progress == solution:
         context.user_data["is_human"] = True
+        context.user_data["captcha_verified_at"] = now
+        context.user_data.pop("captcha_state", None)
+        context.user_data.pop("captcha_block_until", None)
+        context.user_data.pop("captcha_fail_count", None)
         context.user_data.pop("last_captcha_time", None)
-    else:
-        await query.answer("错误，禁言 2 分钟")
-        context.user_data["is_human_error_time"] = time.time()
-    try:
-        await query.message.delete()
-    except TelegramError:
-        logger.debug("Failed to delete captcha message", exc_info=True)
+        await query.answer("验证已通过。")
+        if query.message:
+            await query.edit_message_text(
+                "<b>验证已通过</b>\n\n您现在可以发送消息，系统将为您建立正式对话。",
+                parse_mode="HTML",
+            )
+        return
+
+    await query.answer("选择已记录，请继续。")
+    await send_captcha_challenge(chat.id, user.id, context, query=query)
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    user = query.from_user
+    if user.id not in admin_user_ids:
+        await query.answer("您没有权限执行此操作。", show_alert=True)
+        return
+    parts = query.data.split(":") if query.data else []
+    if len(parts) != 2 or parts[0] != "admin":
+        await query.answer("请求无效。")
+        return
+    action = parts[1]
+    if action == "status":
+        await query.answer("正在获取状态。")
+        if query.message:
+            await query.edit_message_text(await build_status_text(context), parse_mode="HTML", reply_markup=admin_panel_markup())
+        return
+    if action == "banlist":
+        await query.answer("正在获取封禁列表。")
+        if query.message:
+            await query.edit_message_text(await build_ban_list_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+        return
+    if action == "help":
+        await query.answer("正在打开管理说明。")
+        if query.message:
+            await query.edit_message_text(admin_help_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+        return
+    await query.answer("请求无效。")
 
 
 async def ensure_user_topic(user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -453,7 +675,7 @@ async def ensure_user_topic(user: telegram.User, context: ContextTypes.DEFAULT_T
         await db_call(set_thread_status, message_thread_id, "opened")
     await context.bot.send_message(
         admin_group_id,
-        f"新的用户 {mention_html(user.id, user.full_name)} 开始了一个新的会话。",
+        f"用户 {mention_html(user.id, user.full_name)} 已通过验证并开始新的会话。",
         message_thread_id=message_thread_id,
         parse_mode="HTML",
     )
@@ -538,20 +760,20 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     if not message or not user:
         return
     if message_interval and context.user_data.get("last_message_time", 0) > time.time() - message_interval:
-        await message.reply_html("请不要频繁发送消息。")
+        await message.reply_html("消息发送过于频繁，请稍后再试。")
+        return
+    await db_call(update_user_db, user)
+    db_user = await db_call(get_user_by_id, user.id)
+    if db_user and db_user.is_banned:
+        await message.reply_html("当前账号已被限制使用本服务。")
         return
     if not disable_captcha and not await check_human(update, context):
         return
     context.user_data["last_message_time"] = time.time()
 
-    await db_call(update_user_db, user)
-    db_user = await db_call(get_user_by_id, user.id)
-    if db_user and db_user.is_banned:
-        await message.reply_html("你已被禁止使用本机器人。")
-        return
     message_thread_id = await ensure_user_topic(user, context)
     if await db_call(get_thread_status, message_thread_id) == "closed":
-        await message.reply_html("客服已经关闭对话。如需联系，请通过其他途径联系对方重新打开对话。")
+        await message.reply_html("当前会话已关闭。如需继续联系，请通过其他渠道联系管理员重新开启会话。")
         return
 
     if message.media_group_id:
@@ -575,10 +797,10 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     except BadRequest as exc:
         logger.warning("User to admin forwarding failed: %s", exc)
         if is_delete_topic_as_ban_forever:
-            await message.reply_html("发送失败，你的对话已经被客服删除。请联系客服重新打开对话。")
+            await message.reply_html("发送失败：当前会话话题已被删除，请联系管理员重新开启会话。")
         else:
             await db_call(reset_user_topic, user.id)
-            await message.reply_html("发送失败，你的对话已经被客服删除。请再发送一条消息来重新激活对话。")
+            await message.reply_html("发送失败：当前会话话题已被删除。请重新发送消息以创建新的会话。")
     except TelegramError as exc:
         logger.exception("User to admin forwarding failed")
         await message.reply_html(f"发送失败：{escape(str(exc))}")
@@ -605,14 +827,14 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         return
     if message.forum_topic_closed:
         await db_call(set_thread_status, message_thread_id, "closed")
-        await context.bot.send_message(user_id, "对话已经结束。对方已经关闭了对话。你的留言将被忽略。")
+        await context.bot.send_message(user_id, "会话已结束。管理员已关闭当前会话，后续留言将不会被转发。")
         return
     if message.forum_topic_reopened:
         await db_call(set_thread_status, message_thread_id, "opened")
-        await context.bot.send_message(user_id, "对方重新打开了对话。可以继续对话了。")
+        await context.bot.send_message(user_id, "会话已重新开启，您可以继续发送消息。")
         return
     if await db_call(get_thread_status, message_thread_id) == "closed":
-        await message.reply_html("对话已经结束。希望和对方联系，需要打开对话。")
+        await message.reply_html("当前会话已关闭。请重新开启会话后再回复用户。")
         return
 
     if message.media_group_id:
@@ -644,7 +866,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not user:
         return
     if user.id not in admin_user_ids:
-        await message.reply_html("你没有权限执行此操作。")
+        await message.reply_html("您没有权限执行此操作。")
         return
     if not message.message_thread_id:
         await message.reply_html("请在用户会话话题内使用 /clear。")
@@ -675,49 +897,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not user:
         return
     if user.id not in admin_user_ids:
-        await message.reply_html("你没有权限执行此操作。")
+        await message.reply_html("您没有权限执行此操作。")
         return
 
-    db_ok = True
-    db_error = ""
-    try:
-        total_users = await db_call(count_all_users)
-        banned_users = await db_call(count_banned_users)
-        open_topics = await db_call(count_topics_by_status, "opened")
-        closed_topics = await db_call(count_topics_by_status, "closed")
-        deleted_topics = await db_call(count_topics_by_status, "deleted")
-        message_maps = await db_call(count_message_maps)
-    except Exception as exc:
-        logger.exception("Status database check failed")
-        db_ok = False
-        db_error = str(exc)
-        total_users = banned_users = open_topics = closed_topics = deleted_topics = message_maps = 0
-
-    try:
-        admin_group = await context.bot.get_chat(admin_group_id)
-        group_title = admin_group.title or str(admin_group_id)
-        group_ok = True
-    except TelegramError as exc:
-        group_title = str(admin_group_id)
-        group_ok = False
-        db_error = db_error or str(exc)
-
-    await message.reply_html(
-        f"<b>{escape(app_name)} 状态</b>\n\n"
-        f"Bot：online\n"
-        f"后台群：{escape(group_title)} (<code>{admin_group_id}</code>)\n"
-        f"后台群检查：{'ok' if group_ok else 'failed'}\n"
-        f"数据库：{'ok' if db_ok else 'failed'}\n"
-        f"管理员数：{len(admin_user_ids)}\n"
-        f"已记录用户：{total_users}\n"
-        f"封禁用户：{banned_users}\n"
-        f"话题：opened={open_topics} closed={closed_topics} deleted={deleted_topics}\n"
-        f"消息映射：{message_maps}\n"
-        f"验证码：{'disabled' if disable_captcha else 'enabled'}\n"
-        f"消息间隔：{message_interval}s\n"
-        f"媒体组延迟：{media_group_delay}s"
-        + (f"\n\n错误：<code>{escape(db_error)}</code>" if db_error else "")
-    )
+    await message.reply_html(await build_status_text(context), reply_markup=admin_panel_markup())
 
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -726,7 +909,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not admin:
         return
     if admin.id not in admin_user_ids:
-        await message.reply_html("你没有权限执行此操作。")
+        await message.reply_html("您没有权限执行此操作。")
         return
 
     if context.args and context.args[0].lower() == "list":
@@ -737,22 +920,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except ValueError:
                 await message.reply_html("用法：<code>/ban list [数量]</code>，数量必须是 1-50。")
                 return
-        banned_users = await db_call(get_banned_users, limit)
-        total = await db_call(count_banned_users)
-        if not banned_users:
-            await message.reply_html("当前没有封禁用户。")
-            return
-        lines = [f"<b>封禁用户列表</b>（显示 {len(banned_users)}/{total}）"]
-        for index, item in enumerate(banned_users, start=1):
-            reason = escape(item.ban_reason or "无备注")
-            banned_by = f"<code>{item.banned_by}</code>" if item.banned_by else "未知管理员"
-            lines.append(
-                f"\n{index}. {format_user_label(item)}\n"
-                f"时间：{format_datetime(item.banned_at)}\n"
-                f"管理员：{banned_by}\n"
-                f"备注：{reason}"
-            )
-        await message.reply_html("\n".join(lines))
+        await message.reply_html(await build_ban_list_text(limit), reply_markup=admin_panel_markup())
         return
 
     target_user_id: int | None = None
@@ -762,7 +930,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             target_user_id = int(context.args[0])
             reason_parts = context.args[1:]
         except ValueError:
-            await message.reply_html("用法：在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。备注必填。")
+            await message.reply_html("用法：请在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。备注必填。")
             return
     elif message.message_thread_id:
         target_user = await db_call(get_user_by_thread, message.message_thread_id)
@@ -773,7 +941,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html("请在用户会话话题内使用 /ban，或使用 <code>/ban 用户ID 备注</code>。备注必填。")
         return
     if target_user_id in admin_user_ids:
-        await message.reply_html("不能封禁管理员。")
+        await message.reply_html("无法封禁管理员账号。")
         return
 
     reason = " ".join(reason_parts).strip()
@@ -782,14 +950,14 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target_user = await db_call(set_user_ban, target_user_id, True, admin.id, reason)
     if not target_user:
-        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>，需要用户先和机器人产生过记录。")
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
         return
 
     if target_user.message_thread_id:
         await db_call(set_thread_status, target_user.message_thread_id, "closed")
 
     try:
-        await context.bot.send_message(target_user_id, "你已被禁止使用本机器人。")
+        await context.bot.send_message(target_user_id, "当前账号已被限制使用本服务。")
     except TelegramError:
         logger.info("Failed to notify banned user %s", target_user_id, exc_info=True)
 
@@ -805,7 +973,7 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not admin:
         return
     if admin.id not in admin_user_ids:
-        await message.reply_html("你没有权限执行此操作。")
+        await message.reply_html("您没有权限执行此操作。")
         return
 
     target_user_id: int | None = None
@@ -826,14 +994,14 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     target_user = await db_call(set_user_ban, target_user_id, False, admin.id)
     if not target_user:
-        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>，需要用户先和机器人产生过记录。")
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
         return
 
     if target_user.message_thread_id:
         await db_call(set_thread_status, target_user.message_thread_id, "opened")
 
     try:
-        await context.bot.send_message(target_user_id, "你已被解除封禁，可以继续使用本机器人。")
+        await context.bot.send_message(target_user_id, "封禁已解除，您可以继续使用本服务。")
     except TelegramError:
         logger.info("Failed to notify unbanned user %s", target_user_id, exc_info=True)
 
@@ -867,7 +1035,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not message or not user:
         return
     if user.id not in admin_user_ids:
-        await message.reply_html("你没有权限执行此操作。")
+        await message.reply_html("您没有权限执行此操作。")
         return
     if not message.reply_to_message:
         await message.reply_html("这条指令需要回复一条消息，被回复的消息将被广播。")
@@ -878,6 +1046,17 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data={"message_id": message.reply_to_message.message_id, "chat_id": message.chat.id},
     )
     await message.reply_html("广播任务已加入队列。")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if user.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    await message.reply_html(admin_help_text(), reply_markup=admin_panel_markup())
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -893,6 +1072,7 @@ async def post_init(application) -> None:
         ("unban", "解除用户封禁"),
         ("clear", "删除当前用户会话话题"),
         ("broadcast", "广播被回复的消息"),
+        ("help", "查看管理指令说明"),
     ]
     try:
         await application.bot.set_my_commands(commands, scope=telegram.BotCommandScopeDefault())
@@ -920,7 +1100,9 @@ def build_application():
     application.add_handler(CommandHandler("unban", unban, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("status", status, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("broadcast", broadcast, filters.Chat([admin_group_id])))
-    application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^vcode_"))
+    application.add_handler(CommandHandler("help", help_command, filters.Chat([admin_group_id])))
+    application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^captcha:"))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
     application.add_error_handler(error_handler)
     return application
 

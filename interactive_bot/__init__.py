@@ -70,7 +70,7 @@ def _validate_bot_token(token: str) -> str:
 
 bot_token = _validate_bot_token(_required("BOT_TOKEN"))
 app_name = os.getenv("APP_NAME", "interactive-bot")
-welcome_message = os.getenv("WELCOME_MESSAGE", "欢迎使用本机器人")
+welcome_message = os.getenv("WELCOME_MESSAGE", "您好，请问有什么可以帮助您的吗？")
 admin_group_id = _int_env("ADMIN_GROUP_ID", 0)
 if not admin_group_id:
     raise RuntimeError("ADMIN_GROUP_ID 未填写")
