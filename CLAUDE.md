@@ -56,6 +56,8 @@ Start here to understand or extend behavior.
 
 - **Legacy misspellings are intentional.** Table name `formn_status` and the aliases `MediaGroupMesssage` / `FormnStatus` in `db/model.py` are kept for backwards compatibility with existing databases — don't "fix" them.
 
+- **Editing inline-button messages goes through `_safe_edit_text`.** Telegram raises `BadRequest: Message is not modified` when an `edit_message_text` produces content+markup identical to the current message (tapping the same admin panel / captcha button twice, or double-tapping before the first edit lands). `_safe_edit_text(query, ...)` swallows exactly that error and re-raises any other `BadRequest`. Use it for every callback-query edit; never call `query.edit_message_text` directly.
+
 - **Admin command surface.** Admin commands are registered both as handlers (in `build_application`, filtered to the admin group) **and** in the `/` menu (in `post_init`, scoped via `BotCommandScopeChat(chat_id=admin_group_id)`). When adding an admin command, update both places or it won't show in the menu. Private chats only ever see `/start`.
 
 ## Known repo discrepancies

@@ -611,6 +611,18 @@ def _captcha_text(state: dict) -> str:
     return "\n".join(lines)
 
 
+async def _safe_edit_text(query: telegram.CallbackQuery, text: str, **kwargs) -> None:
+    """Edit a callback-query message, ignoring Telegram's harmless
+    'Message is not modified' error. That error fires when the new text and
+    markup are identical to the current message — e.g. tapping the same inline
+    button twice, or double-tapping before the first edit lands."""
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
 async def send_captcha_challenge(
     chat_id: int,
     user_id: int,
@@ -629,7 +641,7 @@ async def send_captcha_challenge(
     text = _captcha_text(state)
     markup = _captcha_markup(user_id, state)
     if query:
-        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        await _safe_edit_text(query, text, reply_markup=markup, parse_mode="HTML")
     else:
         await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
@@ -704,7 +716,8 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["captcha_state"] = _new_captcha()
         await query.answer(f"验证失败，请 {penalty} 秒后重试。", show_alert=True)
         if query.message:
-            await query.edit_message_text(
+            await _safe_edit_text(
+                query,
                 "<b>安全验证未通过</b>\n\n"
                 f"请在 <code>{penalty}</code> 秒后重新验证。连续失败会延长等待时间。",
                 parse_mode="HTML",
@@ -726,7 +739,8 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("last_captcha_time", None)
         await query.answer("验证已通过。")
         if query.message:
-            await query.edit_message_text(
+            await _safe_edit_text(
+                query,
                 "<b>验证已通过</b>\n\n您现在可以发送消息，系统将为您建立正式对话。",
                 parse_mode="HTML",
             )
@@ -752,17 +766,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "status":
         await query.answer("正在获取状态。")
         if query.message:
-            await query.edit_message_text(await build_status_text(context), parse_mode="HTML", reply_markup=admin_panel_markup())
+            await _safe_edit_text(query, await build_status_text(context), parse_mode="HTML", reply_markup=admin_panel_markup())
         return
     if action == "banlist":
         await query.answer("正在获取封禁列表。")
         if query.message:
-            await query.edit_message_text(await build_ban_list_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+            await _safe_edit_text(query, await build_ban_list_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
         return
     if action == "help":
         await query.answer("正在打开管理说明。")
         if query.message:
-            await query.edit_message_text(admin_help_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+            await _safe_edit_text(query, admin_help_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
         return
     await query.answer("请求无效。")
 
