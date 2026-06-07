@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.helpers import mention_html
+from sqlalchemy import func
 
 from db.database import Base, engine, session_scope
 from db.model import ForumStatus, MediaGroupMessage, MessageMap, User, run_schema_migrations
@@ -246,15 +247,36 @@ def count_banned_users() -> int:
         return db.query(User).filter(User.is_banned.is_(True)).count()
 
 
-def get_banned_users(limit: int = 20) -> list[User]:
+def get_banned_users(offset: int = 0, limit: int = 20) -> list[User]:
     with session_scope() as db:
         return (
             db.query(User)
             .filter(User.is_banned.is_(True))
             .order_by(User.banned_at.desc().nullslast(), User.id.desc())
+            .offset(max(offset, 0))
             .limit(limit)
             .all()
         )
+
+
+def get_user_by_username(username: str) -> User | None:
+    handle = username.lstrip("@").strip()
+    if not handle:
+        return None
+    with session_scope() as db:
+        return db.query(User).filter(func.lower(User.username) == handle.lower()).first()
+
+
+def set_user_note(user_id: int, note: str | None) -> User | None:
+    with session_scope() as db:
+        item = db.query(User).filter(User.user_id == user_id).first()
+        if not item:
+            return None
+        item.admin_note = note
+        db.add(item)
+        db.flush()
+        db.refresh(item)
+        return item
 
 
 def count_message_maps() -> int:
@@ -344,11 +366,30 @@ def admin_panel_markup() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("系统状态", callback_data="admin:status"),
-                InlineKeyboardButton("封禁列表", callback_data="admin:banlist"),
+                InlineKeyboardButton("数据统计", callback_data="admin:stats"),
             ],
-            [InlineKeyboardButton("管理指令说明", callback_data="admin:help")],
+            [
+                InlineKeyboardButton("封禁列表", callback_data="admin:banlist"),
+                InlineKeyboardButton("管理指令说明", callback_data="admin:help"),
+            ],
         ]
     )
+
+
+def user_ops_markup(target: User) -> InlineKeyboardMarkup:
+    """Inline action buttons for a specific user, shown under the contact card,
+    /info, and /panel. Destructive ban goes through a confirm step."""
+    uid = target.user_id
+    primary = [InlineKeyboardButton("📇 档案", callback_data=f"admin:op:info:{uid}")]
+    if target.is_banned:
+        primary.append(InlineKeyboardButton("✅ 解封", callback_data=f"admin:op:unban:{uid}"))
+    else:
+        primary.append(InlineKeyboardButton("🚫 封禁", callback_data=f"admin:op:ban:{uid}"))
+    session = [
+        InlineKeyboardButton("🔒 关闭会话", callback_data=f"admin:op:close:{uid}"),
+        InlineKeyboardButton("🔓 重开会话", callback_data=f"admin:op:reopen:{uid}"),
+    ]
+    return InlineKeyboardMarkup([primary, session])
 
 
 def user_start_markup(user_id: int) -> InlineKeyboardMarkup:
@@ -363,24 +404,33 @@ def admin_help_text() -> str:
         "<code>/status</code>：查看系统状态。\n"
         "<code>/stats</code>：查看运营数据统计（今日新增、消息量、活跃会话等）。\n"
         "<code>/info</code>：在用户话题内查看该用户档案；也支持 <code>/info 用户ID</code>。\n"
+        "<code>/panel</code>：打开用户操作面板（档案 / 封禁 / 关闭会话等按钮）。\n"
+        "<code>/find 用户ID|@用户名</code>：搜索用户并查看档案。\n"
+        "<code>/note 备注内容</code>：记录用户内部备注（<code>/note clear</code> 清空）。\n"
         "<code>/ban 备注</code>：在用户会话话题内封禁当前用户，备注必填。\n"
         "<code>/ban 用户ID 备注</code>：封禁指定用户。\n"
         "<code>/banlist [数量]</code>：查看封禁用户列表（默认 20，最多 50）。\n"
         "<code>/ban list [数量]</code>：同上，兼容写法。\n"
         "<code>/unban</code>：在用户会话话题内解除当前用户封禁。\n"
         "<code>/unban 用户ID</code>：解除指定用户封禁。\n"
+        "<code>/close</code>：关闭当前会话（不删除话题），也支持 <code>/close 用户ID</code>。\n"
+        "<code>/reopen</code>：重新打开当前会话，也支持 <code>/reopen 用户ID</code>。\n"
         "<code>/clear</code>：删除当前用户会话话题。\n"
         "<code>/broadcast</code>：回复一条消息后广播给未封禁用户。"
     )
 
 
-async def build_ban_list_text(limit: int = 20) -> str:
-    banned_users = await db_call(get_banned_users, limit)
+BAN_PAGE_SIZE = 10
+
+
+async def build_ban_list_text(offset: int = 0, limit: int = 20) -> str:
+    banned_users = await db_call(get_banned_users, offset, limit)
     total = await db_call(count_banned_users)
     if not banned_users:
-        return "当前没有封禁用户。"
-    lines = [f"<b>封禁用户列表</b>（显示 {len(banned_users)}/{total}）"]
-    for index, item in enumerate(banned_users, start=1):
+        return "当前没有封禁用户。" if offset == 0 else "没有更多封禁用户了。"
+    start = offset + 1
+    lines = [f"<b>封禁用户列表</b>（{start}-{offset + len(banned_users)} / 共 {total}）"]
+    for index, item in enumerate(banned_users, start=start):
         reason = escape(item.ban_reason or "无备注")
         banned_by = f"<code>{item.banned_by}</code>" if item.banned_by else "未知管理员"
         lines.append(
@@ -390,6 +440,17 @@ async def build_ban_list_text(limit: int = 20) -> str:
             f"备注：{reason}"
         )
     return "\n".join(lines)
+
+
+def ban_list_markup(offset: int, shown: int, total: int) -> InlineKeyboardMarkup:
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"admin:banlist:{max(offset - BAN_PAGE_SIZE, 0)}"))
+    if offset + shown < total:
+        nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"admin:banlist:{offset + BAN_PAGE_SIZE}"))
+    rows = [nav] if nav else []
+    rows.append([InlineKeyboardButton("🔙 返回面板", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -436,7 +497,7 @@ async def build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> None:
-    buttons = [
+    link_buttons = [
         [
             InlineKeyboardButton(
                 "🏆 高级会员" if getattr(user, "is_premium", False) else "✈️ 普通会员",
@@ -445,7 +506,19 @@ async def send_contact_card(chat_id: int, message_thread_id: int, user: telegram
         ]
     ]
     if user.username:
-        buttons.append([InlineKeyboardButton("👤 直接联络", url=f"https://t.me/{user.username}")])
+        link_buttons.append([InlineKeyboardButton("👤 直接联络", url=f"https://t.me/{user.username}")])
+    # Quick admin operations for this user (ban / info / close ...).
+    op_rows = [
+        [
+            InlineKeyboardButton("📇 档案", callback_data=f"admin:op:info:{user.id}"),
+            InlineKeyboardButton("🚫 封禁", callback_data=f"admin:op:ban:{user.id}"),
+        ],
+        [
+            InlineKeyboardButton("🔒 关闭会话", callback_data=f"admin:op:close:{user.id}"),
+            InlineKeyboardButton("🔓 重开会话", callback_data=f"admin:op:reopen:{user.id}"),
+        ],
+    ]
+    buttons = link_buttons + op_rows
 
     user_photo = await context.bot.get_user_profile_photos(user.id)
     caption = f"👤 {mention_html(user.id, user.first_name)}\n\n📱 {user.id}\n\n🔗 @{escape(user.username) if user.username else '无'}"
@@ -743,11 +816,71 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
                 query,
                 "<b>验证已通过</b>\n\n您现在可以发送消息，系统将为您建立正式对话。",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("💬 开始咨询", callback_data="guide:start")]]
+                ),
             )
         return
 
     await query.answer("选择已记录，请继续。")
     await send_captcha_challenge(chat.id, user.id, context, query=query)
+
+
+async def _render_user_panel(query: telegram.CallbackQuery, target_user_id: int, note_line: str = "") -> None:
+    target = await db_call(get_user_by_id, target_user_id)
+    if not target:
+        await _safe_edit_text(query, f"未找到用户 <code>{target_user_id}</code>。", parse_mode="HTML")
+        return
+    text = await build_user_profile_text(target)
+    if note_line:
+        text = f"{note_line}\n\n{text}"
+    await _safe_edit_text(query, text, parse_mode="HTML", reply_markup=user_ops_markup(target))
+
+
+async def _handle_user_op(query: telegram.CallbackQuery, op: str, target_user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin_id = query.from_user.id
+    if op == "info":
+        await query.answer()
+        await _render_user_panel(query, target_user_id)
+        return
+    if op == "ban":
+        # Destructive — ask for confirmation first.
+        await query.answer()
+        target = await db_call(get_user_by_id, target_user_id)
+        label = format_user_label(target) if target else f"<code>{target_user_id}</code>"
+        await _safe_edit_text(
+            query,
+            f"确认封禁该用户吗？\n{label}\n\n封禁会关闭其会话并禁止其继续使用本服务。",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("✅ 确认封禁", callback_data=f"admin:op:banyes:{target_user_id}"),
+                    InlineKeyboardButton("取消", callback_data=f"admin:op:info:{target_user_id}"),
+                ]]
+            ),
+        )
+        return
+    if op == "banyes":
+        result = await _apply_ban(context, admin_id, target_user_id, "通过会话按钮快捷封禁")
+        await query.answer("操作完成。")
+        await _render_user_panel(query, target_user_id, result)
+        return
+    if op == "unban":
+        result = await _apply_unban(context, admin_id, target_user_id)
+        await query.answer("操作完成。")
+        await _render_user_panel(query, target_user_id, result)
+        return
+    if op == "close":
+        result = await _apply_close(context, target_user_id)
+        await query.answer("操作完成。")
+        await _render_user_panel(query, target_user_id, result)
+        return
+    if op == "reopen":
+        result = await _apply_reopen(context, target_user_id)
+        await query.answer("操作完成。")
+        await _render_user_panel(query, target_user_id, result)
+        return
+    await query.answer("请求无效。")
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -759,26 +892,48 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("您没有权限执行此操作。", show_alert=True)
         return
     parts = query.data.split(":") if query.data else []
-    if len(parts) != 2 or parts[0] != "admin":
+    if not parts or parts[0] != "admin" or len(parts) < 2:
         await query.answer("请求无效。")
         return
     action = parts[1]
+
     if action == "status":
         await query.answer("正在获取状态。")
-        if query.message:
-            await _safe_edit_text(query, await build_status_text(context), parse_mode="HTML", reply_markup=admin_panel_markup())
+        await _safe_edit_text(query, await build_status_text(context), parse_mode="HTML", reply_markup=admin_panel_markup())
         return
-    if action == "banlist":
-        await query.answer("正在获取封禁列表。")
-        if query.message:
-            await _safe_edit_text(query, await build_ban_list_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+    if action == "stats":
+        await query.answer("正在获取统计。")
+        await _safe_edit_text(query, await build_stats_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
         return
     if action == "help":
         await query.answer("正在打开管理说明。")
-        if query.message:
-            await _safe_edit_text(query, admin_help_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+        await _safe_edit_text(query, admin_help_text(), parse_mode="HTML", reply_markup=admin_panel_markup())
+        return
+    if action == "panel":
+        await query.answer()
+        await _safe_edit_text(
+            query, f"<b>{escape(app_name)} 管理面板</b>\n\n请选择下方操作。", parse_mode="HTML", reply_markup=admin_panel_markup()
+        )
+        return
+    if action == "banlist":
+        offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        await query.answer("正在获取封禁列表。")
+        total = await db_call(count_banned_users)
+        shown = max(0, min(BAN_PAGE_SIZE, total - offset))
+        text = await build_ban_list_text(offset, BAN_PAGE_SIZE)
+        await _safe_edit_text(query, text, parse_mode="HTML", reply_markup=ban_list_markup(offset, shown, total))
+        return
+    if action == "op" and len(parts) == 4 and parts[3].lstrip("-").isdigit():
+        await _handle_user_op(query, parts[2], int(parts[3]), context)
         return
     await query.answer("请求无效。")
+
+
+async def guide_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer("请直接发送您的问题，我们会尽快回复。", show_alert=True)
 
 
 async def ensure_user_topic(user: telegram.User, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -949,12 +1104,16 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
         await db_call(set_thread_status, message_thread_id, "opened")
         return
     if message.forum_topic_closed:
+        was = await db_call(get_thread_status, message_thread_id)
         await db_call(set_thread_status, message_thread_id, "closed")
-        await context.bot.send_message(user_id, "会话已结束。管理员已关闭当前会话，后续留言将不会被转发。")
+        if was != "closed":
+            await context.bot.send_message(user_id, "会话已结束。管理员已关闭当前会话，后续留言将不会被转发。")
         return
     if message.forum_topic_reopened:
+        was = await db_call(get_thread_status, message_thread_id)
         await db_call(set_thread_status, message_thread_id, "opened")
-        await context.bot.send_message(user_id, "会话已重新开启，您可以继续发送消息。")
+        if was != "opened":
+            await context.bot.send_message(user_id, "会话已重新开启，您可以继续发送消息。")
         return
     if await db_call(get_thread_status, message_thread_id) == "closed":
         await message.reply_html("当前会话已关闭。请重新开启会话后再回复用户。")
@@ -981,6 +1140,105 @@ async def forwarding_message_a2u(update: Update, context: ContextTypes.DEFAULT_T
     except TelegramError as exc:
         logger.exception("Admin to user forwarding failed")
         await message.reply_html(f"发送失败：{escape(str(exc))}")
+
+
+async def _target_from_topic_or_arg(message: telegram.Message, args: list[str] | None) -> int | None:
+    """Resolve a target user id from a leading numeric arg, else the current topic."""
+    if args and args[0].isdigit():
+        return int(args[0])
+    if message.message_thread_id:
+        topic_user = await db_call(get_user_by_thread, message.message_thread_id)
+        if topic_user:
+            return topic_user.user_id
+    return None
+
+
+async def build_user_profile_text(target: User) -> str:
+    message_count = await db_call(count_user_messages, target.user_id)
+    member = "🏆 高级会员" if target.is_premium else "✈️ 普通会员"
+    lines = [
+        "<b>用户档案</b>\n",
+        format_user_label(target),
+        f"会员：{member}",
+        f"首次联系：{format_datetime(target.first_seen_at)}",
+        f"最近消息：{format_datetime(target.last_message_at)}",
+        f"累计消息：{message_count}",
+        f"会话话题：{target.message_thread_id or '未创建'}",
+        f"内部备注：{escape(target.admin_note) if target.admin_note else '无'}",
+    ]
+    if target.is_banned:
+        lines.append(
+            f"\n<b>已封禁</b>\n时间：{format_datetime(target.banned_at)}\n"
+            f"管理员：<code>{target.banned_by}</code>\n备注：{escape(target.ban_reason or '无备注')}"
+        )
+    else:
+        lines.append("\n状态：正常")
+    return "\n".join(lines)
+
+
+async def _apply_ban(context: ContextTypes.DEFAULT_TYPE, admin_id: int, target_user_id: int, reason: str) -> str:
+    if target_user_id in admin_user_ids:
+        return "无法封禁管理员账号。"
+    target = await db_call(set_user_ban, target_user_id, True, admin_id, reason)
+    if not target:
+        return f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。"
+    if target.message_thread_id:
+        await db_call(set_thread_status, target.message_thread_id, "closed")
+    try:
+        await context.bot.send_message(target_user_id, "当前账号已被限制使用本服务。")
+    except TelegramError:
+        logger.info("Failed to notify banned user %s", target_user_id, exc_info=True)
+    return f"已封禁用户 <code>{target_user_id}</code>。\n备注：{escape(reason)}"
+
+
+async def _apply_unban(context: ContextTypes.DEFAULT_TYPE, admin_id: int, target_user_id: int) -> str:
+    target = await db_call(set_user_ban, target_user_id, False, admin_id)
+    if not target:
+        return f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。"
+    if target.message_thread_id:
+        await db_call(set_thread_status, target.message_thread_id, "opened")
+    try:
+        await context.bot.send_message(target_user_id, "封禁已解除，您可以继续使用本服务。")
+    except TelegramError:
+        logger.info("Failed to notify unbanned user %s", target_user_id, exc_info=True)
+    return f"已解除封禁用户 <code>{target_user_id}</code>。"
+
+
+async def _apply_close(context: ContextTypes.DEFAULT_TYPE, target_user_id: int) -> str:
+    target = await db_call(get_user_by_id, target_user_id)
+    if not target or not target.message_thread_id:
+        return f"用户 <code>{target_user_id}</code> 当前没有进行中的会话。"
+    if await db_call(get_thread_status, target.message_thread_id) == "closed":
+        return "该会话已处于关闭状态。"
+    # Set status first so the resulting forum_topic_closed service message is a no-op.
+    await db_call(set_thread_status, target.message_thread_id, "closed")
+    try:
+        await context.bot.close_forum_topic(admin_group_id, target.message_thread_id)
+    except TelegramError:
+        logger.warning("Failed to close topic %s", target.message_thread_id, exc_info=True)
+    try:
+        await context.bot.send_message(target_user_id, "会话已结束。管理员已关闭当前会话，后续留言将不会被转发。")
+    except TelegramError:
+        logger.info("Failed to notify user %s about close", target_user_id, exc_info=True)
+    return f"已关闭用户 <code>{target_user_id}</code> 的会话。"
+
+
+async def _apply_reopen(context: ContextTypes.DEFAULT_TYPE, target_user_id: int) -> str:
+    target = await db_call(get_user_by_id, target_user_id)
+    if not target or not target.message_thread_id:
+        return f"用户 <code>{target_user_id}</code> 当前没有会话话题。"
+    if await db_call(get_thread_status, target.message_thread_id) == "opened":
+        return "该会话已处于开启状态。"
+    await db_call(set_thread_status, target.message_thread_id, "opened")
+    try:
+        await context.bot.reopen_forum_topic(admin_group_id, target.message_thread_id)
+    except TelegramError:
+        logger.warning("Failed to reopen topic %s", target.message_thread_id, exc_info=True)
+    try:
+        await context.bot.send_message(target_user_id, "会话已重新开启，您可以继续发送消息。")
+    except TelegramError:
+        logger.info("Failed to notify user %s about reopen", target_user_id, exc_info=True)
+    return f"已重新开启用户 <code>{target_user_id}</code> 的会话。"
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1035,14 +1293,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html("您没有权限执行此操作。")
         return
 
-    target_user_id: int | None = None
-    if context.args and context.args[0].isdigit():
-        target_user_id = int(context.args[0])
-    elif message.message_thread_id:
-        topic_user = await db_call(get_user_by_thread, message.message_thread_id)
-        if topic_user:
-            target_user_id = topic_user.user_id
-
+    target_user_id = await _target_from_topic_or_arg(message, context.args)
     if not target_user_id:
         await message.reply_html("请在用户会话话题内使用 /info，或使用 <code>/info 用户ID</code>。")
         return
@@ -1052,25 +1303,28 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
         return
 
-    message_count = await db_call(count_user_messages, target_user_id)
-    member = "🏆 高级会员" if target.is_premium else "✈️ 普通会员"
-    lines = [
-        "<b>用户档案</b>\n",
-        format_user_label(target),
-        f"会员：{member}",
-        f"首次联系：{format_datetime(target.first_seen_at)}",
-        f"最近消息：{format_datetime(target.last_message_at)}",
-        f"累计消息：{message_count}",
-        f"会话话题：{target.message_thread_id or '未创建'}",
-    ]
-    if target.is_banned:
-        lines.append(
-            f"\n<b>已封禁</b>\n时间：{format_datetime(target.banned_at)}\n"
-            f"管理员：<code>{target.banned_by}</code>\n备注：{escape(target.ban_reason or '无备注')}"
-        )
-    else:
-        lines.append("\n状态：正常")
-    await message.reply_html("\n".join(lines))
+    await message.reply_html(await build_user_profile_text(target), reply_markup=user_ops_markup(target))
+
+
+async def build_stats_text() -> str:
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    total_users = await db_call(count_all_users)
+    today_users = await db_call(count_users_since, day_start)
+    today_messages = await db_call(count_messages_since, day_start)
+    open_topics = await db_call(count_topics_by_status, "opened")
+    banned = await db_call(count_banned_users)
+    total_messages = await db_call(count_message_maps)
+
+    return (
+        f"<b>{escape(app_name)} 运营统计</b>（UTC）\n\n"
+        f"累计用户：{total_users}\n"
+        f"今日新增用户：{today_users}\n"
+        f"今日消息（双向）：{today_messages}\n"
+        f"活跃会话：{open_topics}\n"
+        f"封禁用户：{banned}\n"
+        f"累计消息映射：{total_messages}"
+    )
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1081,26 +1335,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if admin.id not in admin_user_ids:
         await message.reply_html("您没有权限执行此操作。")
         return
-
-    now = datetime.now(timezone.utc)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    total_users = await db_call(count_all_users)
-    today_users = await db_call(count_users_since, day_start)
-    today_messages = await db_call(count_messages_since, day_start)
-    open_topics = await db_call(count_topics_by_status, "opened")
-    banned = await db_call(count_banned_users)
-    total_messages = await db_call(count_message_maps)
-
-    await message.reply_html(
-        f"<b>{escape(app_name)} 运营统计</b>（UTC）\n\n"
-        f"累计用户：{total_users}\n"
-        f"今日新增用户：{today_users}\n"
-        f"今日消息（双向）：{today_messages}\n"
-        f"活跃会话：{open_topics}\n"
-        f"封禁用户：{banned}\n"
-        f"累计消息映射：{total_messages}",
-        reply_markup=admin_panel_markup(),
-    )
+    await message.reply_html(await build_stats_text(), reply_markup=admin_panel_markup())
 
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1120,7 +1355,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except ValueError:
                 await message.reply_html("用法：<code>/ban list [数量]</code>，数量必须是 1-50。")
                 return
-        await message.reply_html(await build_ban_list_text(limit), reply_markup=admin_panel_markup())
+        await message.reply_html(await build_ban_list_text(0, limit), reply_markup=admin_panel_markup())
         return
 
     target_user_id: int | None = None
@@ -1140,31 +1375,12 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not target_user_id:
         await message.reply_html("请在用户会话话题内使用 /ban，或使用 <code>/ban 用户ID 备注</code>。备注必填。")
         return
-    if target_user_id in admin_user_ids:
-        await message.reply_html("无法封禁管理员账号。")
-        return
 
     reason = " ".join(reason_parts).strip()
     if not reason:
         await message.reply_html("封禁备注必填。用法：在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。")
         return
-    target_user = await db_call(set_user_ban, target_user_id, True, admin.id, reason)
-    if not target_user:
-        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
-        return
-
-    if target_user.message_thread_id:
-        await db_call(set_thread_status, target_user.message_thread_id, "closed")
-
-    try:
-        await context.bot.send_message(target_user_id, "当前账号已被限制使用本服务。")
-    except TelegramError:
-        logger.info("Failed to notify banned user %s", target_user_id, exc_info=True)
-
-    await message.reply_html(
-        f"已封禁用户 <code>{target_user_id}</code>。"
-        f"\n备注：{escape(reason)}"
-    )
+    await message.reply_html(await _apply_ban(context, admin.id, target_user_id, reason))
 
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1176,32 +1392,121 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_html("您没有权限执行此操作。")
         return
 
-    target_user_id: int | None = None
-    if context.args and context.args[0].isdigit():
-        target_user_id = int(context.args[0])
-    elif message.message_thread_id:
-        target_user = await db_call(get_user_by_thread, message.message_thread_id)
-        if target_user:
-            target_user_id = target_user.user_id
-
+    target_user_id = await _target_from_topic_or_arg(message, context.args)
     if not target_user_id:
         await message.reply_html("请在用户会话话题内使用 /unban，或使用 <code>/unban 用户ID</code>。")
         return
+    await message.reply_html(await _apply_unban(context, admin.id, target_user_id))
 
-    target_user = await db_call(set_user_ban, target_user_id, False, admin.id)
-    if not target_user:
-        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
+
+async def close_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    target_user_id = await _target_from_topic_or_arg(message, context.args)
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /close，或使用 <code>/close 用户ID</code>。")
+        return
+    await message.reply_html(await _apply_close(context, target_user_id))
+
+
+async def reopen_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    target_user_id = await _target_from_topic_or_arg(message, context.args)
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /reopen，或使用 <code>/reopen 用户ID</code>。")
+        return
+    await message.reply_html(await _apply_reopen(context, target_user_id))
+
+
+async def find_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    if not context.args:
+        await message.reply_html("用法：<code>/find 用户ID</code> 或 <code>/find @用户名</code>。")
+        return
+    query = context.args[0]
+    if query.isdigit():
+        target = await db_call(get_user_by_id, int(query))
+    else:
+        target = await db_call(get_user_by_username, query)
+    if not target:
+        await message.reply_html(f"未找到用户 <code>{escape(query)}</code>。请确认该用户已经与机器人产生过会话记录。")
+        return
+    await message.reply_html(await build_user_profile_text(target), reply_markup=user_ops_markup(target))
+
+
+async def note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
         return
 
-    if target_user.message_thread_id:
-        await db_call(set_thread_status, target_user.message_thread_id, "opened")
+    # `/note <id> <text>` when a leading numeric id is given, otherwise the topic's
+    # user is the target and the whole arg list is the note. `/note clear` wipes it.
+    args = list(context.args or [])
+    if args and args[0].isdigit():
+        target_user_id: int | None = int(args[0])
+        note_parts = args[1:]
+    else:
+        target_user_id = None
+        if message.message_thread_id:
+            topic_user = await db_call(get_user_by_thread, message.message_thread_id)
+            if topic_user:
+                target_user_id = topic_user.user_id
+        note_parts = args
 
-    try:
-        await context.bot.send_message(target_user_id, "封禁已解除，您可以继续使用本服务。")
-    except TelegramError:
-        logger.info("Failed to notify unbanned user %s", target_user_id, exc_info=True)
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /note，或使用 <code>/note 用户ID 备注内容</code>。")
+        return
 
-    await message.reply_html(f"已解除封禁用户 <code>{target_user_id}</code>。")
+    note_text = " ".join(note_parts).strip()
+    cleared = note_text.lower() == "clear" or note_text == "清空"
+    target = await db_call(set_user_note, target_user_id, None if cleared else (note_text or None))
+    if not target:
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
+        return
+    if cleared or not note_text:
+        await message.reply_html(f"已清空用户 <code>{target_user_id}</code> 的内部备注。")
+    else:
+        await message.reply_html(f"已记录用户 <code>{target_user_id}</code> 的内部备注：\n{escape(note_text)}")
+
+
+async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    target_user_id = await _target_from_topic_or_arg(message, context.args)
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /panel，或使用 <code>/panel 用户ID</code>。")
+        return
+    target = await db_call(get_user_by_id, target_user_id)
+    if not target:
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
+        return
+    await message.reply_html(await build_user_profile_text(target), reply_markup=user_ops_markup(target))
 
 
 async def _close_idle_topics(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1285,7 +1590,7 @@ async def banlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except ValueError:
             await message.reply_html("用法：<code>/banlist [数量]</code>，数量必须是 1-50。")
             return
-    await message.reply_html(await build_ban_list_text(limit), reply_markup=admin_panel_markup())
+    await message.reply_html(await build_ban_list_text(0, limit), reply_markup=admin_panel_markup())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1313,9 +1618,14 @@ async def post_init(application) -> None:
         ("status", "查看机器人运行状态"),
         ("stats", "查看运营数据统计"),
         ("info", "查看用户档案（话题内 /info）"),
+        ("panel", "打开用户操作面板（话题内 /panel）"),
+        ("find", "按 ID 或用户名搜索用户"),
+        ("note", "记录用户内部备注（话题内 /note 内容）"),
         ("ban", "封禁用户（话题内 /ban 备注）"),
         ("unban", "解除用户封禁"),
         ("banlist", "查看已封禁用户列表"),
+        ("close", "关闭当前会话（不删除话题）"),
+        ("reopen", "重新打开当前会话"),
         ("clear", "删除当前用户会话话题"),
         ("broadcast", "广播被回复的消息"),
         ("help", "查看管理指令说明"),
@@ -1349,6 +1659,11 @@ def build_application():
     application.add_handler(CommandHandler("ban", ban, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("unban", unban, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("banlist", banlist, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("close", close_session, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("reopen", reopen_session, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("find", find_user, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("note", note, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("panel", panel, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("status", status, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("stats", stats, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("info", info, filters.Chat([admin_group_id])))
@@ -1356,6 +1671,7 @@ def build_application():
     application.add_handler(CommandHandler("help", help_command, filters.Chat([admin_group_id])))
     application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^captcha:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
+    application.add_handler(CallbackQueryHandler(guide_callback, pattern="^guide:"))
     application.add_error_handler(error_handler)
 
     if idle_close_hours > 0 and application.job_queue:

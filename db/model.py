@@ -68,6 +68,7 @@ class User(Base):
     banned_at = Column(DateTime(timezone=True))
     banned_by = Column(BigInteger)
     ban_reason = Column(String(1024))
+    admin_note = Column(String(1024))
 
 
 def _sqlite_columns(engine: Engine, table_name: str) -> set[str]:
@@ -105,6 +106,8 @@ def run_schema_migrations(engine: Engine) -> None:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN banned_by BIGINT'))
         if "ban_reason" not in user_columns:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN ban_reason VARCHAR(1024)'))
+        if "admin_note" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN admin_note VARCHAR(1024)'))
 
         media_columns = _sqlite_columns(engine, "media_group_message")
         if "caption_html" not in media_columns:

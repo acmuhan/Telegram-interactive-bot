@@ -32,9 +32,18 @@ Four source files carry everything; the rest is assets/docs.
 `build_application()` (`interactive_bot/__main__.py`) is the routing table. Direction is decided by **chat-type filters**, not message content:
 - `filters.ChatType.PRIVATE` → `forwarding_message_u2a` (user → admin)
 - `filters.Chat([admin_group_id])` → `forwarding_message_a2u` (admin → user) and all admin commands
-- `^captcha:` / `^admin:` callback-query patterns drive the inline-button flows.
+- `^captcha:` (user verification), `^admin:` (admin panel + per-user ops), `^guide:` (user-side guide button) callback-query patterns drive the inline-button flows.
 
 Start here to understand or extend behavior.
+
+### Callback-data namespaces
+
+Inline buttons encode their action in `callback_data`, parsed by `str.split(":")`:
+- `captcha:{user_id}:{action}:{value}` — verification (`action` ∈ `refresh`/`digit`).
+- `admin:{action}` — panel views: `status` / `stats` / `help` / `panel`.
+- `admin:banlist[:{offset}]` — paginated ban list (offset omitted = page 0; `ban_list_markup` builds prev/next).
+- `admin:op:{op}:{user_id}` — per-user operations: `info` / `ban` (shows confirm) / `banyes` (executes) / `unban` / `close` / `reopen`. All run through the shared `_apply_*` coroutines so buttons and the equivalent commands behave identically. `_handle_user_op` dispatches these; `_render_user_panel` re-renders the profile + `user_ops_markup` after each.
+- `guide:start` — user-side "start chatting" hint after passing captcha.
 
 ## Conventions that will trip you up
 
@@ -50,7 +59,7 @@ Start here to understand or extend behavior.
 
 - **Thread lifecycle.** `ForumStatus` tracks `opened`/`closed`/`deleted`. Admins closing or reopening a forum topic produces Telegram service messages (`forum_topic_closed` / `forum_topic_reopened`) that `forwarding_message_a2u` intercepts to update status and notify the user. A `closed` thread blocks relaying in both directions. When `IDLE_CLOSE_HOURS > 0`, a `run_repeating` job (`_close_idle_topics`, hourly) closes `opened` topics whose user's `last_message_at` is older than the window. Users with `last_message_at IS NULL` are skipped so brand-new topics aren't closed.
 
-- **User activity timestamps.** `User.first_seen_at` is set on first `update_user_db`; `User.last_message_at` is bumped by `touch_user_activity()` on every verified inbound user message (powers `/info`, `/stats`, and idle-close). Per-user message totals come from counting `MessageMap` rows, not a stored counter.
+- **User activity timestamps.** `User.first_seen_at` is set on first `update_user_db`; `User.last_message_at` is bumped by `touch_user_activity()` on every verified inbound user message (powers `/info`, `/stats`, and idle-close). Per-user message totals come from counting `MessageMap` rows, not a stored counter. `User.admin_note` holds an admin-only note (set via `/note`, shown in `/info`).
 
 - **Schema migrations are hand-rolled and SQLite-only.** `run_schema_migrations()` runs on startup and does conservative `ALTER TABLE ... ADD COLUMN` for new nullable columns; it no-ops on non-SQLite. There is no Alembic. When you add a column to a model, also add the matching guarded `ALTER TABLE` here, or existing SQLite DBs won't get it.
 
