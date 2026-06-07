@@ -169,4 +169,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-.env
+# VS Code: ignore local settings but keep the shared debug config.
+.vscode/*
+!.vscode/launch.json
+
+# Codegraph local index (machine-specific, regenerated on demand)
+.codegraph/

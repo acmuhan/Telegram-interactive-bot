@@ -61,6 +61,8 @@ class User(Base):
     username = Column(String(256))
     is_premium = Column(Boolean, default=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_message_at = Column(DateTime(timezone=True))
     message_thread_id = Column(Integer, default=0, nullable=False)
     is_banned = Column(Boolean, default=False, nullable=False)
     banned_at = Column(DateTime(timezone=True))
@@ -91,6 +93,10 @@ def run_schema_migrations(engine: Engine) -> None:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN is_premium BOOLEAN DEFAULT 0'))
         if "updated_at" not in user_columns:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN updated_at DATETIME'))
+        if "first_seen_at" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN first_seen_at DATETIME'))
+        if "last_message_at" not in user_columns:
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN last_message_at DATETIME'))
         if "is_banned" not in user_columns:
             conn.execute(text('ALTER TABLE "user" ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT 0'))
         if "banned_at" not in user_columns:

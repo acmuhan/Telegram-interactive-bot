@@ -8,7 +8,7 @@
             "name": "BOT",
             "type": "debugpy",
             "request": "launch",
-            "module": "interactive-bot",
+            "module": "interactive_bot",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {

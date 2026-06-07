@@ -3,7 +3,7 @@ import os
 import random
 import time
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import ParamSpec, TypeVar
 
@@ -33,6 +33,7 @@ from . import (
     captcha_cooldown_seconds,
     disable_captcha,
     enable_pickle_persistence,
+    idle_close_hours,
     is_delete_topic_as_ban_forever,
     is_delete_user_messages,
     logger,
@@ -78,8 +79,11 @@ def update_user_db(user: telegram.User) -> None:
             existing.last_name = user.last_name
             existing.username = user.username
             existing.is_premium = bool(getattr(user, "is_premium", False))
+            if existing.first_seen_at is None:
+                existing.first_seen_at = datetime.now(timezone.utc)
             db.add(existing)
             return
+        now = datetime.now(timezone.utc)
         db.add(
             User(
                 user_id=user.id,
@@ -87,8 +91,17 @@ def update_user_db(user: telegram.User) -> None:
                 last_name=user.last_name,
                 username=user.username,
                 is_premium=bool(getattr(user, "is_premium", False)),
+                first_seen_at=now,
             )
         )
+
+
+def touch_user_activity(user_id: int) -> None:
+    with session_scope() as db:
+        item = db.query(User).filter(User.user_id == user_id).first()
+        if item:
+            item.last_message_at = datetime.now(timezone.utc)
+            db.add(item)
 
 
 def get_user_by_id(user_id: int) -> User | None:
@@ -249,6 +262,44 @@ def count_message_maps() -> int:
         return db.query(MessageMap).count()
 
 
+def count_user_messages(user_id: int) -> int:
+    with session_scope() as db:
+        return db.query(MessageMap).filter(MessageMap.user_id == user_id).count()
+
+
+def count_users_since(since: datetime) -> int:
+    with session_scope() as db:
+        return db.query(User).filter(User.first_seen_at.isnot(None), User.first_seen_at >= since).count()
+
+
+def count_messages_since(since: datetime) -> int:
+    with session_scope() as db:
+        return db.query(MessageMap).filter(MessageMap.created_at.isnot(None), MessageMap.created_at >= since).count()
+
+
+def get_idle_open_topics(idle_before: datetime) -> list[tuple[int, int]]:
+    """Return (user_id, message_thread_id) for opened topics whose user has been
+    silent since `idle_before`. Users who never sent a tracked message
+    (last_message_at IS NULL) are skipped to avoid closing brand-new topics."""
+    with session_scope() as db:
+        rows = (
+            db.query(User.user_id, User.message_thread_id)
+            .join(
+                ForumStatus,
+                (ForumStatus.message_thread_id == User.message_thread_id)
+                & (ForumStatus.chat_id == admin_group_id),
+            )
+            .filter(
+                User.message_thread_id != 0,
+                ForumStatus.status == "opened",
+                User.last_message_at.isnot(None),
+                User.last_message_at < idle_before,
+            )
+            .all()
+        )
+        return [(int(user_id), int(thread_id)) for user_id, thread_id in rows]
+
+
 def count_topics_by_status(status: str) -> int:
     with session_scope() as db:
         return db.query(ForumStatus).filter(ForumStatus.chat_id == admin_group_id, ForumStatus.status == status).count()
@@ -310,9 +361,12 @@ def admin_help_text() -> str:
     return (
         "<b>管理指令说明</b>\n\n"
         "<code>/status</code>：查看系统状态。\n"
+        "<code>/stats</code>：查看运营数据统计（今日新增、消息量、活跃会话等）。\n"
+        "<code>/info</code>：在用户话题内查看该用户档案；也支持 <code>/info 用户ID</code>。\n"
         "<code>/ban 备注</code>：在用户会话话题内封禁当前用户，备注必填。\n"
         "<code>/ban 用户ID 备注</code>：封禁指定用户。\n"
-        "<code>/ban list [数量]</code>：查看封禁用户列表。\n"
+        "<code>/banlist [数量]</code>：查看封禁用户列表（默认 20，最多 50）。\n"
+        "<code>/ban list [数量]</code>：同上，兼容写法。\n"
         "<code>/unban</code>：在用户会话话题内解除当前用户封禁。\n"
         "<code>/unban 用户ID</code>：解除指定用户封禁。\n"
         "<code>/clear</code>：删除当前用户会话话题。\n"
@@ -470,37 +524,91 @@ def _captcha_penalty_seconds(fail_count: int) -> int:
     return min(base * (2 ** max(fail_count - 1, 0)), 15 * 60)
 
 
-def _new_numeric_captcha() -> dict:
-    digits = random.sample(range(10), 5)
-    solution = sorted(str(digit) for digit in digits)
-    now = time.time()
+def _shuffled_unsorted(count: int) -> list[str]:
+    """Pick `count` distinct digits whose display order is neither ascending nor
+    descending, so a sort challenge always requires real reordering."""
+    digits = random.sample(range(10), count)
+    while digits == sorted(digits) or digits == sorted(digits, reverse=True):
+        random.shuffle(digits)
+    return [str(d) for d in digits]
+
+
+def _new_sort_captcha() -> dict:
+    options = _shuffled_unsorted(5)
     return {
-        "type": "numeric_sequence",
-        "digits": [str(digit) for digit in digits],
-        "solution": solution,
-        "progress": [],
-        "created_at": now,
-        "expires_at": now + 120,
+        "type": "sort",
+        "prompt": "请按照<b>从小到大</b>的顺序依次点击下方数字。",
+        "options": options,
+        "solution": sorted(options),
     }
 
 
+def _new_arith_captcha() -> dict:
+    a, b = random.randint(2, 19), random.randint(2, 19)
+    if random.random() < 0.5:
+        answer = a + b
+        prompt = f"请计算并点击正确答案：<b>{a} + {b} = ?</b>"
+    else:
+        if a < b:
+            a, b = b, a
+        answer = a - b
+        prompt = f"请计算并点击正确答案：<b>{a} - {b} = ?</b>"
+    options = {answer}
+    while len(options) < 4:
+        delta = random.randint(-5, 5)
+        candidate = answer + delta
+        if candidate >= 0:
+            options.add(candidate)
+    shuffled = [str(value) for value in random.sample(list(options), len(options))]
+    return {
+        "type": "arith",
+        "prompt": prompt,
+        "options": shuffled,
+        "solution": [str(answer)],
+    }
+
+
+def _new_pick_captcha() -> dict:
+    options = [str(d) for d in random.sample(range(10), 6)]
+    target = random.choice(options)
+    return {
+        "type": "pick",
+        "prompt": f"请点击数字 <b>{target}</b>。",
+        "options": options,
+        "solution": [target],
+    }
+
+
+def _new_captcha() -> dict:
+    state = random.choice([_new_sort_captcha, _new_arith_captcha, _new_pick_captcha])()
+    now = time.time()
+    state["progress"] = []
+    state["created_at"] = now
+    state["expires_at"] = now + 120
+    return state
+
+
 def _captcha_markup(user_id: int, state: dict) -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(str(digit), callback_data=f"captcha:{user_id}:digit:{digit}") for digit in state["digits"]]
+    options = state.get("options") or []
+    buttons = [InlineKeyboardButton(opt, callback_data=f"captcha:{user_id}:digit:{opt}") for opt in options]
     rows = [buttons[index : index + 5] for index in range(0, len(buttons), 5)]
     rows.append([InlineKeyboardButton("刷新验证题", callback_data=f"captcha:{user_id}:refresh:0")])
     return InlineKeyboardMarkup(rows)
 
 
 def _captcha_text(state: dict) -> str:
-    progress = " ".join(state.get("progress") or []) or "尚未选择"
     expires_at = format_datetime(datetime.fromtimestamp(float(state["expires_at"]), tz=timezone.utc))
-    return (
-        "<b>安全验证</b>\n\n"
-        "为保障服务质量，请先完成验证。验证通过后，系统将为您建立正式对话。\n\n"
-        "请按照从小到大的顺序依次点击下方数字。\n"
-        f"当前选择：<code>{escape(progress)}</code>\n"
-        f"有效期至：{expires_at}"
-    )
+    lines = [
+        "<b>安全验证</b>\n",
+        "为保障服务质量，请先完成验证。验证通过后，系统将为您建立正式对话。\n",
+        state.get("prompt", "请完成下方验证。"),
+    ]
+    # Multi-step challenges (the sort task) show what's been tapped so far.
+    if len(state.get("solution") or []) > 1:
+        progress = " ".join(state.get("progress") or []) or "尚未选择"
+        lines.append(f"当前选择：<code>{escape(progress)}</code>")
+    lines.append(f"有效期至：{expires_at}")
+    return "\n".join(lines)
 
 
 async def send_captcha_challenge(
@@ -514,7 +622,7 @@ async def send_captcha_challenge(
     state = context.user_data.get("captcha_state")
     now = time.time()
     if force_new or not state or state.get("expires_at", 0) <= now:
-        state = _new_numeric_captcha()
+        state = _new_captcha()
         context.user_data["captcha_state"] = state
         context.user_data["last_captcha_time"] = now
 
@@ -593,7 +701,7 @@ async def callback_query_vcode(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["captcha_fail_count"] = fail_count
         penalty = _captcha_penalty_seconds(fail_count)
         context.user_data["captcha_block_until"] = now + penalty
-        context.user_data["captcha_state"] = _new_numeric_captcha()
+        context.user_data["captcha_state"] = _new_captcha()
         await query.answer(f"验证失败，请 {penalty} 秒后重试。", show_alert=True)
         if query.message:
             await query.edit_message_text(
@@ -770,6 +878,7 @@ async def forwarding_message_u2a(update: Update, context: ContextTypes.DEFAULT_T
     if not disable_captcha and not await check_human(update, context):
         return
     context.user_data["last_message_time"] = time.time()
+    await db_call(touch_user_activity, user.id)
 
     message_thread_id = await ensure_user_topic(user, context)
     if await db_call(get_thread_status, message_thread_id) == "closed":
@@ -903,6 +1012,83 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_html(await build_status_text(context), reply_markup=admin_panel_markup())
 
 
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+
+    target_user_id: int | None = None
+    if context.args and context.args[0].isdigit():
+        target_user_id = int(context.args[0])
+    elif message.message_thread_id:
+        topic_user = await db_call(get_user_by_thread, message.message_thread_id)
+        if topic_user:
+            target_user_id = topic_user.user_id
+
+    if not target_user_id:
+        await message.reply_html("请在用户会话话题内使用 /info，或使用 <code>/info 用户ID</code>。")
+        return
+
+    target = await db_call(get_user_by_id, target_user_id)
+    if not target:
+        await message.reply_html(f"未找到用户 <code>{target_user_id}</code>。请确认该用户已经与机器人产生过会话记录。")
+        return
+
+    message_count = await db_call(count_user_messages, target_user_id)
+    member = "🏆 高级会员" if target.is_premium else "✈️ 普通会员"
+    lines = [
+        "<b>用户档案</b>\n",
+        format_user_label(target),
+        f"会员：{member}",
+        f"首次联系：{format_datetime(target.first_seen_at)}",
+        f"最近消息：{format_datetime(target.last_message_at)}",
+        f"累计消息：{message_count}",
+        f"会话话题：{target.message_thread_id or '未创建'}",
+    ]
+    if target.is_banned:
+        lines.append(
+            f"\n<b>已封禁</b>\n时间：{format_datetime(target.banned_at)}\n"
+            f"管理员：<code>{target.banned_by}</code>\n备注：{escape(target.ban_reason or '无备注')}"
+        )
+    else:
+        lines.append("\n状态：正常")
+    await message.reply_html("\n".join(lines))
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    admin = update.effective_user
+    if not message or not admin:
+        return
+    if admin.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    total_users = await db_call(count_all_users)
+    today_users = await db_call(count_users_since, day_start)
+    today_messages = await db_call(count_messages_since, day_start)
+    open_topics = await db_call(count_topics_by_status, "opened")
+    banned = await db_call(count_banned_users)
+    total_messages = await db_call(count_message_maps)
+
+    await message.reply_html(
+        f"<b>{escape(app_name)} 运营统计</b>（UTC）\n\n"
+        f"累计用户：{total_users}\n"
+        f"今日新增用户：{today_users}\n"
+        f"今日消息（双向）：{today_messages}\n"
+        f"活跃会话：{open_topics}\n"
+        f"封禁用户：{banned}\n"
+        f"累计消息映射：{total_messages}",
+        reply_markup=admin_panel_markup(),
+    )
+
+
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     admin = update.effective_user
@@ -924,14 +1110,14 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     target_user_id: int | None = None
-    reason_parts: list[str] = []
-    if context.args:
-        try:
-            target_user_id = int(context.args[0])
-            reason_parts = context.args[1:]
-        except ValueError:
-            await message.reply_html("用法：请在用户话题内发送 <code>/ban 备注</code>，或发送 <code>/ban 用户ID 备注</code>。备注必填。")
-            return
+    reason_parts: list[str] = list(context.args)
+
+    # A leading pure-number token means the explicit `/ban <user_id> <reason>` form.
+    # Otherwise, inside a user topic every argument is the reason, so `/ban 备注`
+    # bans that topic's user (the primary workflow). Reason stays mandatory in both.
+    if context.args and context.args[0].isdigit():
+        target_user_id = int(context.args[0])
+        reason_parts = context.args[1:]
     elif message.message_thread_id:
         target_user = await db_call(get_user_by_thread, message.message_thread_id)
         if target_user:
@@ -977,12 +1163,8 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     target_user_id: int | None = None
-    if context.args:
-        try:
-            target_user_id = int(context.args[0])
-        except ValueError:
-            await message.reply_html("用法：在用户话题内发送 <code>/unban</code>，或发送 <code>/unban 用户ID</code>。")
-            return
+    if context.args and context.args[0].isdigit():
+        target_user_id = int(context.args[0])
     elif message.message_thread_id:
         target_user = await db_call(get_user_by_thread, message.message_thread_id)
         if target_user:
@@ -1006,6 +1188,32 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Failed to notify unbanned user %s", target_user_id, exc_info=True)
 
     await message.reply_html(f"已解除封禁用户 <code>{target_user_id}</code>。")
+
+
+async def _close_idle_topics(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodically close forum topics whose user has been silent past the
+    configured idle window, keeping the admin group tidy."""
+    if idle_close_hours <= 0:
+        return
+    idle_before = datetime.now(timezone.utc) - timedelta(hours=idle_close_hours)
+    idle_topics = await db_call(get_idle_open_topics, idle_before)
+    for user_id, thread_id in idle_topics:
+        try:
+            await context.bot.close_forum_topic(admin_group_id, thread_id)
+        except TelegramError:
+            logger.warning("Failed to auto-close idle topic %s", thread_id, exc_info=True)
+            continue
+        await db_call(set_thread_status, thread_id, "closed")
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"由于超过 {idle_close_hours} 小时没有新消息，本次会话已自动关闭。"
+                "如需继续联系，请重新发送消息。",
+            )
+        except TelegramError:
+            logger.info("Failed to notify user %s about idle close", user_id, exc_info=True)
+    if idle_topics:
+        logger.info("Auto-closed %s idle topic(s)", len(idle_topics))
 
 
 async def _broadcast(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1048,6 +1256,24 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_html("广播任务已加入队列。")
 
 
+async def banlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if user.id not in admin_user_ids:
+        await message.reply_html("您没有权限执行此操作。")
+        return
+    limit = 20
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            await message.reply_html("用法：<code>/banlist [数量]</code>，数量必须是 1-50。")
+            return
+    await message.reply_html(await build_ban_list_text(limit), reply_markup=admin_panel_markup())
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     user = update.effective_user
@@ -1064,23 +1290,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application) -> None:
-    """Register Telegram command suggestions after the bot starts."""
-    commands = [
-        ("start", "开始使用 / 检查后台群配置"),
-        ("status", "查看机器人状态"),
-        ("ban", "封禁用户或查看封禁列表"),
+    """Register Telegram command suggestions and the chat menu button.
+
+    Commands are scoped so the `/` menu only advertises admin commands where they
+    actually work (the admin group), while private chats only see `/start`.
+    """
+    admin_commands = [
+        ("status", "查看机器人运行状态"),
+        ("stats", "查看运营数据统计"),
+        ("info", "查看用户档案（话题内 /info）"),
+        ("ban", "封禁用户（话题内 /ban 备注）"),
         ("unban", "解除用户封禁"),
+        ("banlist", "查看已封禁用户列表"),
         ("clear", "删除当前用户会话话题"),
         ("broadcast", "广播被回复的消息"),
         ("help", "查看管理指令说明"),
     ]
+    private_commands = [("start", "开始使用 / 完成安全验证")]
     try:
-        await application.bot.set_my_commands(commands, scope=telegram.BotCommandScopeDefault())
-        await application.bot.set_my_commands(commands, scope=telegram.BotCommandScopeAllGroupChats())
+        # Default + all-private: ordinary users only ever need /start.
+        await application.bot.set_my_commands(private_commands, scope=telegram.BotCommandScopeDefault())
+        await application.bot.set_my_commands(private_commands, scope=telegram.BotCommandScopeAllPrivateChats())
+        # Admin group: show the full admin toolbox in the `/` menu, scoped to that chat.
         await application.bot.set_my_commands(
-            [("start", "开始使用 / 管理员检查后台群配置")],
-            scope=telegram.BotCommandScopeAllPrivateChats(),
+            admin_commands, scope=telegram.BotCommandScopeChat(chat_id=admin_group_id)
         )
+        # Show the hamburger "Menu" button that opens the command list.
+        await application.bot.set_chat_menu_button(menu_button=telegram.MenuButtonCommands())
     except TelegramError:
         logger.warning("Failed to register Telegram bot commands", exc_info=True)
 
@@ -1098,12 +1334,21 @@ def build_application():
     application.add_handler(CommandHandler("clear", clear, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("ban", ban, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("unban", unban, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("banlist", banlist, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("status", status, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("stats", stats, filters.Chat([admin_group_id])))
+    application.add_handler(CommandHandler("info", info, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("broadcast", broadcast, filters.Chat([admin_group_id])))
     application.add_handler(CommandHandler("help", help_command, filters.Chat([admin_group_id])))
     application.add_handler(CallbackQueryHandler(callback_query_vcode, pattern="^captcha:"))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
     application.add_error_handler(error_handler)
+
+    if idle_close_hours > 0 and application.job_queue:
+        # Scan hourly; the query itself enforces the idle window.
+        application.job_queue.run_repeating(
+            _close_idle_topics, interval=3600, first=300, name="close_idle_topics"
+        )
     return application
 
 
